@@ -30,6 +30,7 @@ def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
             goal_max_turns=3, model_override='loop-model', provider_override='custom')
         kb.recompute_ready(conn)
         task = kb.claim_task(conn, task_id)
+    assert task is not None and task.current_run_id is not None
     actor = SessionActor('owner', str(tmp_path), frozenset({'session:create'}), 'transport')
     connection = SimpleNamespace(authority=SimpleNamespace(profile_id=str(tmp_path)), actor=actor, native_owner=True)
     params = dict(board='owned', task_id=task.id, run_id=task.current_run_id, claim_lock=task.claim_lock)
@@ -45,7 +46,14 @@ def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
     assert context['board'] == 'owned' and context['claim_lock'] == task.claim_lock
     assert context['skills'] == ['owned-skill'] and context['goal_mode'] and context['goal_max_turns'] == 3
     assert context['accept_hooks'] is True and 'Goal criteria' in context['goal_text']
-    for changed in ({'run_id': task.current_run_id + 1}, {'board': 'foreign'}, {'claim_lock': 'forged'}, {'cwd': '/tmp'}):
+    assert 'required_worker_plugin' not in context  # ordinary stock card
+    with closing(connect(board='owned')) as conn:
+        conn.execute('UPDATE tasks SET required_worker_plugin=? WHERE id=?', ('worker-guard', task.id))
+        conn.commit()
+    pinned, _ = build_kanban_policy(connection, params, config)
+    assert json.loads(pinned.kanban_json)['required_worker_plugin'] == 'worker-guard'
+    for changed in ({'run_id': task.current_run_id + 1}, {'board': 'foreign'}, {'claim_lock': 'forged'}, {'cwd': '/tmp'},
+                    {'required_worker_plugin': None}):
         with pytest.raises(AuthorityRefusal):
             build_kanban_policy(connection, params | changed, config)
     connection.native_owner = False

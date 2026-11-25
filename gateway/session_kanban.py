@@ -41,6 +41,7 @@ def build_kanban_policy(connection, params, config):
             if bound and json.loads(bound[0])['request_id'] != 'kanban:' + json.dumps([board, task.id, task.current_run_id], separators=(',', ':')):
                 raise AuthorityRefusal('stale_kanban_claim')
             context = kb.build_worker_context(conn, task.id)
+            required_plugin = conn.execute('SELECT required_worker_plugin FROM tasks WHERE id=?', (task.id,)).fetchone()[0]
             skills = list(task.skills or ())
             if kb._retry_status_for_run(conn, task.id, task.current_run_id) == 'review':
                 # Same rule as the dispatcher's review lane: the reviewer always loads sdlc-review.
@@ -56,6 +57,8 @@ def build_kanban_policy(connection, params, config):
         goal_text='\n\n'.join(p for p in (task.title, task.body) if p), context=context,
         max_runtime_seconds=task.max_runtime_seconds, accept_hooks=True)
     context['db'] = str(path)
+    if required_plugin is not None:
+        context['required_worker_plugin'] = required_plugin
     request = json.loads(policy.request_json)
     request.update(source='kanban', board=board, task_id=task.id, run_id=task.current_run_id)
     return replace(policy, source='kanban', platform='cli', toolsets=tuple(sorted(set(policy.toolsets) | {'kanban'})),
@@ -196,6 +199,7 @@ def bind_worker_context(frame):
             if (task is None or task.status != 'running' or task.current_run_id != context['run_id']
                     or task.claim_lock != context['claim_lock']):
                 raise AuthorityRefusal('stale_kanban_claim')
+            required = conn.execute('SELECT required_worker_plugin FROM tasks WHERE id=?', (task.id,)).fetchone()[0]
             # The dispatcher's spawned worker stays the run's pid (reclaim, timeout and operator
             # kills target it; ``_watch_submitter`` ties this interpreter's life to it). The bound
             # interpreter is recorded beside it so a sweep can tell when the attempt is truly gone.
@@ -213,6 +217,20 @@ def bind_worker_context(frame):
     _watch_submitter(Path(context['db']), context['run_id'])
     os.environ.update(env)
     os.chdir(context['workspace'])
+    _enforce_worker_plugin(context, required)
+
+
+def _enforce_worker_plugin(context, required):
+    """A persisted requirement is independent of skill loading and optional hooks."""
+    try:
+        if context.get('required_worker_plugin') != required:
+            raise ValueError('required_worker_plugin_unavailable')
+        if required is not None:
+            from hermes_cli.middleware import bind_required_worker_plugin
+            bind_required_worker_plugin(required)
+    except ValueError:
+        _record_worker_result(context, 1, 'required_worker_plugin_unavailable')
+        raise
 
 
 _TURNS_DONE = threading.Event()

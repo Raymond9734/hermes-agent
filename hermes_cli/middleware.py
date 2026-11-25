@@ -25,6 +25,31 @@ VALID_MIDDLEWARE: set[str] = {
     TOOL_REQUEST_MIDDLEWARE, TOOL_EXECUTION_MIDDLEWARE, LLM_REQUEST_MIDDLEWARE, LLM_EXECUTION_MIDDLEWARE,
 }
 
+# Bound only in the private, single-turn Kanban worker process (like its frozen config).
+# Process-wide deliberately: a stock executor can enter the chain on another thread.
+_worker_guards: dict[str, Callable] = {}
+
+
+def bind_required_worker_plugin(plugin: str) -> None:
+    """Require a successfully loaded owner of both execution guards before agent startup."""
+    from hermes_cli.plugins import _delivery_manager
+
+    manager = _delivery_manager()
+    with manager._discovery_lock:
+        loaded = manager._plugins.get(plugin)
+        if not loaded or not loaded.enabled or loaded.error:
+            raise ValueError('required_worker_plugin_unavailable')
+        handles = manager._ownership_ledger.get(plugin, ())
+        guards = {}
+        for kind in (LLM_EXECUTION_MIDDLEWARE, TOOL_EXECUTION_MIDDLEWARE):
+            registered = manager._middleware.get(kind, ())
+            owned = [h.callback for h in handles if h.active and h.kind == 'middleware'
+                     and h.key == kind and any(h.callback is callback for callback in registered)]
+            if len(owned) != 1 or not callable(owned[0]):
+                raise ValueError('required_worker_plugin_unavailable')
+            guards[kind] = owned[0]
+        _worker_guards.update(guards)
+
 
 @dataclass
 class RequestMiddlewareResult:
@@ -166,6 +191,12 @@ def _run_execution_chain(kind: str, terminal_call: Callable[[Any], Any], **kwarg
     payload_key = "request" if "request" in kwargs else "args"
     manager = _delivery_manager()
     callbacks = list(manager._middleware.get(kind, []))
+    guard = _worker_guards.get(kind)
+    if guard is not None:
+        if not any(callback is guard for callback in callbacks):
+            raise ValueError('required_worker_plugin_unavailable')
+        # Validate the final payload, after every optional execution wrapper.
+        callbacks = [callback for callback in callbacks if callback is not guard] + [guard]
     if not callbacks:
         return terminal_call(kwargs[payload_key])
 
@@ -209,7 +240,7 @@ def _run_execution_chain(kind: str, terminal_call: Callable[[Any], Any], **kwarg
             manager._report_hook_failure(kind, callback, call_kwargs, exc, surface="Middleware")
             if next_succeeded:
                 return next_result
-            if next_called:
+            if next_called or callback is guard:
                 raise
             return call_at(index + 1, payload)
 

@@ -46,6 +46,7 @@ class PluginRegistration:
     # Staged change applied only once the plugin's load succeeded (``_publish_staged_registrations``); a failed
     # or timed-out load disposes the handle first, so the change is never applied.
     publish: Optional[Callable[[], Any]] = None
+    callback: Optional[Callable[..., Any]] = field(default=None, repr=False)
     _disposed: bool = field(default=False, init=False, repr=False)
     _on_dispose: Optional[Callable[[PluginRegistration], None]] = field(default=None, init=False, repr=False)
 
