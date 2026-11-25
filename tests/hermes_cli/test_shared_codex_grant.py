@@ -242,11 +242,15 @@ def test_primary_pool_with_stale_manual_grant_adopts_worker_rotation(stores, mon
 
 def test_processes_share_exactly_one_root_refresh(stores, tmp_path):
     root, worker = stores
-    started = row(source='device_code', access_token=token(expired=True))
+    subject = 'fixture-federation|fixture-member'
+    started = row(source='device_code', access_token=token(subject=subject, expired=True))
     unrelated = row('other', 'other-account', priority=1)
-    expected = token(generation=2)
+    expected = token(subject=subject, generation=2)
     seed(root, started, unrelated, singleton={k: started[k] for k in ('access_token', 'refresh_token')})
     atomic_config_write(root / 'config.yaml', {'model': {'provider': PROVIDER}})
+    settings = config()
+    settings['auth']['shared_providers'][PROVIDER]['subject'] = subject
+    atomic_config_replace(worker / 'config.yaml', settings)
     calls = []
     lock = Lock()
 
@@ -379,3 +383,57 @@ def test_frozen_worker_cannot_be_retargeted_by_later_config_edit(stores):
     with frozen_runtime_config(frozen):
         assert resolve_runtime_provider(requested=PROVIDER)['api_key'] == selected['access_token']
     assert resolve_runtime_provider(requested=PROVIDER)['api_key'] == replacement['access_token']
+
+
+def test_federated_subject_lists_and_resolves_exact_singleton(stores, monkeypatch):
+    from hermes_cli.auth_codex import list_shareable_codex_grants
+
+    root, worker = stores
+    subject = 'fixture-federation|fixture-member'
+    access = token(subject=subject)
+    selected = row(source='device_code')
+    selected['access_token'] = access
+    singleton = {'access_token': access, 'refresh_token': selected['refresh_token']}
+    seed(root, selected, singleton=singleton)
+    monkeypatch.setenv('HERMES_HOME', str(root))
+    refs = list_shareable_codex_grants()
+    assert [(ref.credential_id, ref.account_id, ref.subject) for ref in refs] == [(ROW, ACCOUNT, subject)]
+
+    monkeypatch.setenv('HERMES_HOME', str(worker))
+    settings = config()
+    configured_ref = settings['auth']['shared_providers'][PROVIDER]
+    configured_ref['subject'] = subject
+    atomic_config_replace(worker / 'config.yaml', settings)
+    assert resolve_runtime_provider(requested=PROVIDER)['source'] == 'shared-root-oauth'
+    configured_ref['subject'] = 'different-federation|fixture-member'
+    atomic_config_replace(worker / 'config.yaml', settings)
+    with pytest.raises(auth.AuthError, match='Referenced root Codex OAuth grant'):
+        resolve_runtime_provider(requested=PROVIDER)
+
+    # A provider claim must match literally: trimming it must not manufacture a match.
+    selected['access_token'] = singleton['access_token'] = token(subject=f' {subject}')
+    seed(root, selected, singleton=singleton)
+    monkeypatch.setenv('HERMES_HOME', str(root))
+    assert list_shareable_codex_grants() == []
+    monkeypatch.setenv('HERMES_HOME', str(worker))
+    configured_ref['subject'] = subject
+    atomic_config_replace(worker / 'config.yaml', settings)
+    with pytest.raises(auth.AuthError, match='Referenced root Codex OAuth grant'):
+        resolve_runtime_provider(requested=PROVIDER)
+    assert not (worker / 'auth.json').exists()
+
+
+@pytest.mark.parametrize(('field', 'value'), [
+    ('account_id', 'issuer|member'), ('credential_id', 'issuer|member'),
+    ('subject', 'issuer|other|member'), ('subject', 'issuer|../member'),
+    ('subject', 'issuer|member:other'), ('subject', 'issuer|'),
+    ('subject', '|member'), ('subject', 'issuer|member\n'), ('subject', 'issuer| leading-space'),
+    ('subject', 'i|' + 'm' * 127),
+])
+def test_subject_namespace_does_not_relax_reference_validation(field, value):
+    from hermes_cli.auth_shared_providers import parse_shared_provider_refs
+
+    settings = config()
+    settings['auth']['shared_providers'][PROVIDER][field] = value
+    with pytest.raises(auth.AuthError, match='Invalid shared provider credential policy'):
+        parse_shared_provider_refs(settings)

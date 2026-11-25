@@ -26,6 +26,14 @@ def valid_reference_id(value: Any) -> TypeGuard[str]:
     return isinstance(value, str) and _ID.fullmatch(value) is not None
 
 
+def valid_codex_reference_subject(value: Any) -> TypeGuard[str]:
+    """Accept an opaque, literal Codex subject; federated subjects can contain one pipe."""
+    if not isinstance(value, str) or len(value) > 128:
+        return False
+    namespace, separator, member = value.partition('|')
+    return valid_reference_id(namespace) and (not separator or valid_reference_id(member))
+
+
 def invalid_shared_policy() -> SharedProviderAuthError:
     return SharedProviderAuthError('Invalid shared provider credential policy.', code='invalid_shared_provider_policy')
 
@@ -44,7 +52,8 @@ def parse_shared_provider_refs(config: dict[str, Any]) -> dict[str, SharedProvid
     for provider, ref in refs.items():
         if (provider not in _SUPPORTED or not isinstance(ref, dict)
                 or ref.keys() != {'source', 'credential_id', 'account_id', 'subject'} or ref['source'] != 'root'
-                or not all(valid_reference_id(ref[key]) for key in ('credential_id', 'account_id', 'subject'))):
+                or not all(valid_reference_id(ref[key]) for key in ('credential_id', 'account_id'))
+                or not valid_codex_reference_subject(ref['subject'])):
             raise invalid_shared_policy()
         parsed[provider] = SharedProviderRef(ref['credential_id'], ref['account_id'], ref['subject'])
     return parsed

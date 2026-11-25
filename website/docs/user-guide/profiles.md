@@ -135,10 +135,12 @@ auth:
       source: root
       credential_id: REPLACE_WITH_ROW_ID
       account_id: REPLACE_WITH_ACCOUNT_ID
-      subject: REPLACE_WITH_SUBJECT
+      subject: 'REPLACE_WITH_SUBJECT'
 ```
 
 These are identifiers, not bearer or refresh tokens. Both identity fields are required because team members can share an account ID. Select `openai-codex` explicitly for the route; an automatic or fallback selection cannot opt in. This reference is for the native Responses transport at `https://chatgpt.com/backend-api/codex`, not Codex App Server, a proxy, or OpenAI API-key authentication. If the exact row is absent, revoked, or no longer matches its identity, the reference fails instead of choosing another row. Refreshes update the main profile's credential in place; the worker has no copy. No other provider or main-profile environment variable is inherited by this setting.
+
+Copy the `subject` literally, including its namespace and `|` separator if present. It accepts a single identifier or `namespace|member`, up to 128 characters total. Each component must start with an ASCII letter or digit and may also contain `_` and `-`. `credential_id` and `account_id` still accept only single identifiers, without `|`.
 
 ### Clone from a specific profile
 

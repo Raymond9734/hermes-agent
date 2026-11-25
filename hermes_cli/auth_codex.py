@@ -24,7 +24,9 @@ from hermes_cli.auth_constants import (
     _decode_jwt_claims, AUTH_LOCK_TIMEOUT_SECONDS, AuthError,
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS, CODEX_OAUTH_CLIENT_ID, CODEX_OAUTH_TOKEN_URL,
     CODEX_RATE_LIMITED_CODE, DEFAULT_CODEX_BASE_URL, _codex_err, httpx)
-from hermes_cli.auth_shared_providers import SharedProviderAuthError, SharedProviderRef, active_shared_provider_refs
+from hermes_cli.auth_shared_providers import (
+    SharedProviderAuthError, SharedProviderRef, active_shared_provider_refs,
+    valid_codex_reference_subject, valid_reference_id)
 from hermes_cli.version_info import hermes_user_agent
 from utils import env_float, normalize_proxy_env_vars
 
@@ -614,6 +616,17 @@ def _shared_codex_unavailable() -> SharedProviderAuthError:
         provider="openai-codex", code="shared_codex_grant_unavailable")
 
 
+def _shared_codex_principal_identity(access_token: Any) -> Optional[tuple[str, str]]:
+    """Return validated literal claims; legacy pool matching trims them."""
+    claims = _decode_jwt_claims(access_token)
+    auth_claims = claims.get("https://api.openai.com/auth")
+    account_id = auth_claims.get("chatgpt_account_id") if isinstance(auth_claims, dict) else None
+    subject = claims.get("sub")
+    if valid_reference_id(account_id) and valid_codex_reference_subject(subject):
+        return account_id, subject
+    return None
+
+
 def _shared_codex_row(store: dict[str, Any], ref: SharedProviderRef) -> dict[str, Any]:
     from agent.credential_pool import PooledCredential, _codex_principal_identity, _exhausted_until
     from hermes_cli.auth import _credential_token_pair, _nonempty_str
@@ -623,7 +636,7 @@ def _shared_codex_row(store: dict[str, Any], ref: SharedProviderRef) -> dict[str
     if len(matches) != 1:
         raise _shared_codex_unavailable()
     row = matches[0]
-    principal = _codex_principal_identity(row.get("access_token"))
+    principal = _shared_codex_principal_identity(row.get("access_token"))
     if (row.get("auth_type") != "oauth" or row.get("source") not in ("device_code", "manual:device_code", "manual:browser")
             or (row.get("base_url") or DEFAULT_CODEX_BASE_URL) != DEFAULT_CODEX_BASE_URL
             or principal != (ref.account_id, ref.subject) or not _nonempty_str(row.get("refresh_token"))
@@ -650,7 +663,6 @@ def list_shareable_codex_grants() -> list[SharedProviderRef]:
     """Main-profile metadata only: don't seed, adopt, heal, or refresh a pool."""
     from agent.credential_pool import _codex_principal_identity
     from hermes_cli.auth import _auth_file_path, _load_auth_store, _load_provider_state
-    from hermes_cli.auth_shared_providers import valid_reference_id
     from hermes_constants import get_default_hermes_root, get_hermes_home
 
     if get_hermes_home().resolve() != get_default_hermes_root().resolve():
@@ -664,9 +676,9 @@ def list_shareable_codex_grants() -> list[SharedProviderRef]:
     singleton_principal = (_codex_principal_identity(singleton.get("access_token"))
                            if isinstance(singleton, dict) else None)
     for row in _codex_pool_dicts(_pool_entries(store, "openai-codex")):
-        principal = _codex_principal_identity(row.get("access_token"))
+        principal = _shared_codex_principal_identity(row.get("access_token"))
         credential_id = row.get("id")
-        if not valid_reference_id(credential_id) or principal is None or not all(map(valid_reference_id, principal)):
+        if not valid_reference_id(credential_id) or principal is None:
             continue
         # Same-principal manual device-code rows mirror the singleton. List its
         # canonical persisted ID instead of presenting aliases as separate grants.
@@ -683,12 +695,13 @@ def list_shareable_codex_grants() -> list[SharedProviderRef]:
 
 def _rotate_shared_codex_row(store: dict[str, Any], path: Path, row: dict[str, Any], timeout: float) -> None:
     """Rotate in the already-locked native root store; never fall into CLI adoption."""
-    from agent.credential_pool import _codex_principal_identity
     from hermes_cli.auth import (_credential_token_pair, _is_terminal_codex_oauth_refresh_error,
                                  _save_auth_store, refresh_codex_oauth_pure)
 
     pair = _credential_token_pair(row)
-    principal = _codex_principal_identity(pair[0])
+    principal = _shared_codex_principal_identity(pair[0])
+    if principal is None:
+        raise _shared_codex_unavailable()
     providers = store.get("providers")
     state = providers.get("openai-codex") if isinstance(providers, dict) else None
     singleton = state.get("tokens") if isinstance(state, dict) else None
@@ -704,7 +717,7 @@ def _rotate_shared_codex_row(store: dict[str, Any], path: Path, row: dict[str, A
         if not _is_terminal_codex_oauth_refresh_error(exc):
             raise _shared_codex_unavailable() from None
         fresh = None
-    if fresh is not None and _codex_principal_identity(fresh.get("access_token")) != principal:
+    if fresh is not None and _shared_codex_principal_identity(fresh.get("access_token")) != principal:
         fresh = None
     for alias in aliases:
         _clear_pool_entry_status(alias)
