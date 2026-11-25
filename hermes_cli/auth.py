@@ -507,8 +507,25 @@ def _global_auth_file_path() -> Optional[Path]:
     if path is None:
         return None
     from hermes_cli.config import load_config_readonly
-    auth = load_config_readonly().get("auth")
-    if isinstance(auth, dict) and auth.get("inherit_root_credentials", True) is not True:
+    from hermes_cli.config_effective import load_user_config_effective
+    from hermes_cli.config_read_errors import FailedConfigRead
+
+    config = load_config_readonly()
+    # Defaults and last-known-good can keep the app usable, but neither authorizes
+    # a named profile to borrow credentials when its current config failed to load.
+    if isinstance(config, FailedConfigRead):
+        return None
+    auth = config.get("auth", {})
+    if not isinstance(auth, dict) or auth.get("inherit_root_credentials", True) is not True:
+        return None
+    # The default merge treats a null section as omitted and can normalize a
+    # false-y non-mapping YAML root. Check the strict user layer (or frozen
+    # worker snapshot) before granting a borrow on otherwise-default settings.
+    try:
+        declared_auth = load_user_config_effective(fail_closed=True).get("auth", {})
+    except Exception:
+        return None
+    if not isinstance(declared_auth, dict) or declared_auth.get("inherit_root_credentials", True) is not True:
         return None
     return path
 
