@@ -593,19 +593,25 @@ class ClientLifecycleMixin:
             return False
         singleton_key = str(singleton_now.get("api_key") or "").strip()
         old_key = str(self.api_key or "").strip()
-        if singleton_key and old_key and singleton_key != old_key:
+        shared = singleton_now.get("source") == "shared-root-oauth"
+        if shared:
+            from agent.credential_pool import _codex_principal_identity
+            if not old_key or _codex_principal_identity(old_key) != _codex_principal_identity(singleton_key):
+                return False
+        if singleton_key and old_key and singleton_key != old_key and not shared:
             logger.debug(
                 "%s singleton tokens differ from the active api_key; skipping singleton force-refresh to avoid "
                 "silent account swap. Reactive credential rotation should go through the pool.", self.provider,
             )
             return False
         try:
-            creds = resolve(force_refresh=force)
+            creds = (_auth.resolve_codex_runtime_credentials(force_refresh=force, stale_access_token=old_key)
+                     if shared else resolve(force_refresh=force))
         except Exception as exc:
             logger.debug("%s credential refresh failed: %s", self.provider, exc)
             return False
         api_key, base_url = creds.get("api_key"), creds.get("base_url")
-        if not _valid_credential_pair(api_key, base_url):
+        if not isinstance(api_key, str) or not isinstance(base_url, str) or not _valid_credential_pair(api_key, base_url):
             return False
         # No NEW token minted (the resolver returns the same stale token when refresh fails) → False.
         if old_key and api_key.strip() == old_key:

@@ -14,6 +14,7 @@ import logging
 import hashlib
 import json
 import os
+import stat
 import threading
 import time
 from contextlib import suppress
@@ -23,6 +24,7 @@ from hermes_cli.auth_constants import (
     _decode_jwt_claims, AUTH_LOCK_TIMEOUT_SECONDS, AuthError,
     CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS, CODEX_OAUTH_CLIENT_ID, CODEX_OAUTH_TOKEN_URL,
     CODEX_RATE_LIMITED_CODE, DEFAULT_CODEX_BASE_URL, _codex_err, httpx)
+from hermes_cli.auth_shared_providers import SharedProviderAuthError, SharedProviderRef, active_shared_provider_refs
 from hermes_cli.version_info import hermes_user_agent
 from utils import env_float, normalize_proxy_env_vars
 
@@ -606,10 +608,161 @@ def _import_codex_cli_tokens() -> Optional[dict[str, str]]:
         return None
 
 
+def _shared_codex_unavailable() -> SharedProviderAuthError:
+    return SharedProviderAuthError(
+        "Referenced root Codex OAuth grant is unavailable. Check the approved grant in the main Hermes profile.",
+        provider="openai-codex", code="shared_codex_grant_unavailable")
+
+
+def _shared_codex_row(store: dict[str, Any], ref: SharedProviderRef) -> dict[str, Any]:
+    from agent.credential_pool import PooledCredential, _codex_principal_identity, _exhausted_until
+    from hermes_cli.auth import _credential_token_pair, _nonempty_str
+
+    entries = _pool_entries(store, "openai-codex") or []
+    matches = [row for row in _codex_pool_dicts(entries) if row.get("id") == ref.credential_id]
+    if len(matches) != 1:
+        raise _shared_codex_unavailable()
+    row = matches[0]
+    principal = _codex_principal_identity(row.get("access_token"))
+    if (row.get("auth_type") != "oauth" or row.get("source") not in ("device_code", "manual:device_code", "manual:browser")
+            or (row.get("base_url") or DEFAULT_CODEX_BASE_URL) != DEFAULT_CODEX_BASE_URL
+            or principal != (ref.account_id, ref.subject) or not _nonempty_str(row.get("refresh_token"))
+            or row.get("last_status") == "dead"):
+        raise _shared_codex_unavailable()
+    providers = store.get("providers")
+    state = providers.get("openai-codex") if isinstance(providers, dict) else None
+    singleton = state.get("tokens") if isinstance(state, dict) else None
+    # A singleton mirror is not an independent grant. Do not use its stale
+    # bearer or refresh token after a logout or a replacement.
+    if row.get("source") == "device_code" or (
+            isinstance(singleton, dict) and _codex_principal_identity(singleton.get("access_token")) == principal):
+        if _credential_token_pair(singleton) != _credential_token_pair(row):
+            raise _shared_codex_unavailable()
+    if row.get("last_status") == "exhausted":
+        reset_at = _exhausted_until(PooledCredential.from_dict("openai-codex", row), sole_credential=True)
+        if reset_at is not None and reset_at > time.time():
+            raise SharedProviderAuthError("Referenced root Codex OAuth grant is in cooldown.",
+                                          provider="openai-codex", code=CODEX_RATE_LIMITED_CODE)
+    return row
+
+
+def list_shareable_codex_grants() -> list[SharedProviderRef]:
+    """Main-profile metadata only: don't seed, adopt, heal, or refresh a pool."""
+    from agent.credential_pool import _codex_principal_identity
+    from hermes_cli.auth import _auth_file_path, _load_auth_store
+    from hermes_cli.auth_shared_providers import valid_reference_id
+    from hermes_constants import get_default_hermes_root, get_hermes_home
+
+    if get_hermes_home().resolve() != get_default_hermes_root().resolve():
+        raise SystemExit("List shareable Codex OAuth rows from the main profile only.")
+    try:
+        store = _load_auth_store(_auth_file_path(), preserve_corrupt=False)
+    except (OSError, ValueError, TypeError):
+        raise _shared_codex_unavailable() from None
+    refs = []
+    for row in _codex_pool_dicts(_pool_entries(store, "openai-codex")):
+        principal = _codex_principal_identity(row.get("access_token"))
+        credential_id = row.get("id")
+        if not valid_reference_id(credential_id) or principal is None or not all(map(valid_reference_id, principal)):
+            continue
+        ref = SharedProviderRef(credential_id, *principal)
+        try:
+            _shared_codex_row(store, ref)
+        except SharedProviderAuthError:
+            continue
+        refs.append(ref)
+    return refs
+
+
+def _rotate_shared_codex_row(store: dict[str, Any], path: Path, row: dict[str, Any], timeout: float) -> None:
+    """Rotate in the already-locked native root store; never fall into CLI adoption."""
+    from agent.credential_pool import _codex_principal_identity
+    from hermes_cli.auth import (_credential_token_pair, _is_terminal_codex_oauth_refresh_error,
+                                 _save_auth_store, refresh_codex_oauth_pure)
+
+    pair = _credential_token_pair(row)
+    principal = _codex_principal_identity(pair[0])
+    providers = store.get("providers")
+    state = providers.get("openai-codex") if isinstance(providers, dict) else None
+    singleton = state.get("tokens") if isinstance(state, dict) else None
+    tracks_singleton = _credential_token_pair(singleton) == pair
+    aliases = [item for item in _codex_pool_dicts(_pool_entries(store, "openai-codex"))
+               if _credential_token_pair(item) == pair]
+    try:
+        fresh = refresh_codex_oauth_pure(*pair, timeout_seconds=timeout)
+    except AuthError as exc:
+        if exc.code == CODEX_RATE_LIMITED_CODE:
+            raise SharedProviderAuthError("Referenced root Codex OAuth grant is rate limited.",
+                                          provider="openai-codex", code=CODEX_RATE_LIMITED_CODE) from None
+        if not _is_terminal_codex_oauth_refresh_error(exc):
+            raise _shared_codex_unavailable() from None
+        fresh = None
+    if fresh is not None and _codex_principal_identity(fresh.get("access_token")) != principal:
+        fresh = None
+    for alias in aliases:
+        _clear_pool_entry_status(alias)
+        if fresh is None:
+            # Keep the inert bearer for the main pool's identity metadata; no spender may replay its refresh token.
+            alias.update(refresh_token=None, last_status="dead", last_status_at=time.time())
+        else:
+            alias.update(fresh)
+    if tracks_singleton and isinstance(state, dict) and isinstance(singleton, dict):
+        if fresh is None:
+            singleton.pop("access_token", None)
+            singleton.pop("refresh_token", None)
+        else:
+            singleton.update(access_token=fresh["access_token"], refresh_token=fresh["refresh_token"])
+            state["last_refresh"] = fresh["last_refresh"]
+    _save_auth_store(store, target_path=path)
+    if fresh is None:
+        raise _shared_codex_unavailable()
+
+
+def resolve_shared_codex_runtime(ref: SharedProviderRef, *, force_refresh: bool = False,
+                                 refresh_if_expiring: bool = True, read_only: bool = False,
+                                 stale_access_token: Optional[str] = None,
+                                 refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS) -> dict[str, Any]:
+    from agent.credential_pool import _guarded_global_root
+    from hermes_cli.auth import _auth_store_lock, _load_auth_store, _root_auth_path_for_profile
+
+    path = _guarded_global_root(_root_auth_path_for_profile())
+    if path is None:
+        raise _shared_codex_unavailable()
+
+    def load() -> dict[str, Any]:
+        info = path.lstat()
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1 or path.with_suffix(".lock").is_symlink():
+            raise _shared_codex_unavailable()
+        return _load_auth_store(path, preserve_corrupt=False)
+
+    def needs_refresh(current: dict[str, Any]) -> bool:
+        force = force_refresh and (stale_access_token is None or stale_access_token == current["access_token"])
+        return force or (refresh_if_expiring and _codex_access_token_is_expiring(current["access_token"], refresh_skew_seconds))
+
+    try:
+        row = _shared_codex_row(load(), ref)
+        if not read_only and needs_refresh(row):
+            timeout = env_float("HERMES_CODEX_REFRESH_TIMEOUT_SECONDS", 20)
+            # Same flock as the primary pool and its singleton. Recheck the actual generation under it.
+            with _auth_store_lock(max(AUTH_LOCK_TIMEOUT_SECONDS, timeout + 5.0), target_path=path):
+                locked_store = load()
+                current = _shared_codex_row(locked_store, ref)
+                if needs_refresh(current) and (current["access_token"], current["refresh_token"]) == (
+                        row["access_token"], row["refresh_token"]):
+                    _rotate_shared_codex_row(locked_store, path, current, timeout)
+                if refresh_if_expiring and _codex_access_token_is_expiring(current["access_token"], 0):
+                    raise _shared_codex_unavailable()
+                row = current
+    except (OSError, ValueError, TypeError, TimeoutError, httpx.HTTPError):
+        raise _shared_codex_unavailable() from None
+    return _codex_runtime_result(row["access_token"], source="shared-root-oauth",
+                                 last_refresh=row.get("last_refresh"), base_url=DEFAULT_CODEX_BASE_URL)
+
+
 def resolve_codex_runtime_credentials(
     *, force_refresh: bool = False, refresh_if_expiring: bool = True,
     refresh_skew_seconds: int = CODEX_ACCESS_TOKEN_REFRESH_SKEW_SECONDS,
-    read_only: bool = False) -> dict[str, Any]:
+    read_only: bool = False, stale_access_token: Optional[str] = None) -> dict[str, Any]:
     """Resolve runtime credentials from Hermes's own Codex token store.
 
     ``read_only=True`` (status / doctor / pickers) reports the stored state as-is: no Codex CLI
@@ -629,6 +782,10 @@ def resolve_codex_runtime_credentials(
     from hermes_cli.auth import (
         _auth_store_lock, _codex_access_token_is_expiring, _probe_codex_quota_restored,
         _read_codex_tokens)
+    if ref := active_shared_provider_refs().get("openai-codex"):
+        return resolve_shared_codex_runtime(ref, force_refresh=force_refresh, refresh_if_expiring=refresh_if_expiring,
+                                           refresh_skew_seconds=refresh_skew_seconds, read_only=read_only,
+                                           stale_access_token=stale_access_token)
     read_error: Optional[AuthError] = None
     data = None
     observed: Optional[str] = None

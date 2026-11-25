@@ -122,6 +122,24 @@ hermes -p <name> config set auth.adopt_external_logins false
 
 The first setting leaves the default behavior of other profiles unchanged. The second separately disables automatic adoption of external CLI logins, such as Claude Code. Add a dedicated provider credential using `hermes -p <name> auth add <provider>` or an approved profile secret source. This policy does not scrub a shell's environment, copy or delete credentials, or provide an OS isolation boundary.
 
+### Reference an existing main-profile Codex grant
+
+To reuse one existing Hermes `openai-codex` OAuth grant without signing in again, run `hermes auth list openai-codex --shareable` in the main profile. This read-only command lists eligible persisted rows without refreshing or adding credentials. Identify the approved native OAuth row and use its `id`, `account_id`, and `subject` in the **named profile's** `config.yaml`:
+
+```yaml
+auth:
+  inherit_root_credentials: false
+  adopt_external_logins: false
+  shared_providers:
+    openai-codex:
+      source: root
+      credential_id: REPLACE_WITH_ROW_ID
+      account_id: REPLACE_WITH_ACCOUNT_ID
+      subject: REPLACE_WITH_SUBJECT
+```
+
+These are identifiers, not bearer or refresh tokens. Both identity fields are required because team members can share an account ID. Select `openai-codex` explicitly for the route; an automatic or fallback selection cannot opt in. This reference is for the native Responses transport at `https://chatgpt.com/backend-api/codex`, not Codex App Server, a proxy, or OpenAI API-key authentication. If the exact row is absent, revoked, or no longer matches its identity, the reference fails instead of choosing another row. Refreshes update the main profile's credential in place; the worker has no copy. No other provider or main-profile environment variable is inherited by this setting.
+
 ### Clone from a specific profile
 
 ```bash

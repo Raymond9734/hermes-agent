@@ -527,6 +527,14 @@ def _global_auth_file_path() -> Optional[Path]:
         return None
     if not isinstance(declared_auth, dict) or declared_auth.get("inherit_root_credentials", True) is not True:
         return None
+    # A scoped reference can never be combined with the legacy whole-store fallback,
+    # even when the reference is malformed or a flag was accidentally left at its default.
+    from hermes_cli.auth_shared_providers import parse_shared_provider_refs, SharedProviderAuthError
+    try:
+        if parse_shared_provider_refs({"auth": declared_auth}):
+            return None
+    except SharedProviderAuthError:
+        return None
     return path
 
 
@@ -752,7 +760,7 @@ def _empty_auth_store() -> dict[str, Any]:
     return {"version": AUTH_STORE_VERSION, "providers": {}}
 
 
-def _load_auth_store(auth_file: Optional[Path] = None) -> dict[str, Any]:
+def _load_auth_store(auth_file: Optional[Path] = None, *, preserve_corrupt: bool = True) -> dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
         return _empty_auth_store()
@@ -768,6 +776,9 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> dict[str, Any]:
             auth_file, exc_info=True)
         raise
     except Exception as exc:
+        if not preserve_corrupt:
+            # A scoped credential reader may not create a second file holding the root store.
+            raise
         # Genuine corruption: unparseable JSON or non-UTF-8 bytes. Preserve a copy, but never
         # advertise a backup that was not written.
         corrupt_path = auth_file.with_suffix(".json.corrupt")

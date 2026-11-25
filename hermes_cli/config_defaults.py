@@ -1698,6 +1698,8 @@ DEFAULT_CONFIG = {
     "auth": {  # Login policy (credentials themselves live in auth.json / .env).
         # Allow a named profile without its own credentials to use the root auth store.
         "inherit_root_credentials": True,
+        # Optional account-pinned references to root-owned OAuth grants; never a store fallback.
+        "shared_providers": {},
         # Borrow and refresh the Codex CLI (~/.codex/auth.json) and Claude Code (~/.claude/.credentials.json)
         # logins automatically when Hermes has no usable login of its own. Their refresh tokens are single-use
         # and rotate, so two programs on one login can log each other out; set false to make Hermes use only

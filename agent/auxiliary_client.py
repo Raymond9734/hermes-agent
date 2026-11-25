@@ -2070,6 +2070,11 @@ def _resolve_codex_credential_and_base(model: Optional[str] = None) -> tuple[Opt
     it belongs to (#121486): the profile-scoped ``HERMES_CODEX_BASE_URL`` wins; otherwise a pooled
     key goes where that pool entry routes (row URL / ``model.base_url``) and the auth.json OAuth
     token goes to the ChatGPT default. ``(None, <base>)`` without a usable token."""
+    from hermes_cli.auth_shared_providers import active_shared_provider_refs
+    if "openai-codex" in active_shared_provider_refs():
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+        creds = resolve_runtime_provider(requested="openai-codex", target_model=model)
+        return creds["api_key"], creds["base_url"]
     override = _codex_base_url_override()
     pool_present, entry = _select_pool_entry("openai-codex", model)  # a model-scoped cooldown spares siblings
     if pool_present:
@@ -3621,8 +3626,13 @@ def _creds_have_api_key(creds: dict[str, Any]) -> bool:
     return bool(str(creds.get("api_key", "") or "").strip())
 
 
-def _refresh_codex_credentials() -> bool:
+def _refresh_codex_credentials(failed_api_key: str = "") -> bool:
     from hermes_cli.auth import resolve_codex_runtime_credentials
+    from hermes_cli.auth_shared_providers import active_shared_provider_refs
+    if "openai-codex" in active_shared_provider_refs():
+        if not failed_api_key:
+            return False
+        return _creds_have_api_key(resolve_codex_runtime_credentials(force_refresh=True, stale_access_token=failed_api_key))
     return _creds_have_api_key(resolve_codex_runtime_credentials(force_refresh=True))
 
 
@@ -3687,7 +3697,9 @@ def _refresh_provider_credentials(provider: str, *, failed_api_key: str = "") ->
             return False
         refresher = lambda: profile.refresh_runtime_credentials(reason="auxiliary_unauthorized")
     try:
-        if not (refresher(failed_api_key) if normalized == "anthropic" else refresher()):
+        key_arg = (failed_api_key,) if normalized == "anthropic" or (
+            normalized == "openai-codex" and failed_api_key) else ()
+        if not refresher(*key_arg):
             return False
         _evict_cached_clients(normalized)
         return True

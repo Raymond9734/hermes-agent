@@ -32,6 +32,7 @@ from hermes_cli.auth import (  # resolve_external_process_provider_credentials i
     has_usable_secret, is_actual_local_base_url, looks_like_openrouter_key, normalize_actual_base_url,
 )
 from hermes_cli import config as _config_mod
+from hermes_cli.auth_shared_providers import SharedProviderAuthError, active_shared_provider_refs
 from hermes_cli import models as _models  # attribute access keeps ``hermes_cli.models.<name>`` patches effective
 from hermes_constants import OPENROUTER_BASE_URL
 from hermes_cli.providers import determine_api_mode, get_provider, is_actual_route, is_official_openai_host, nous_api_mode
@@ -1234,6 +1235,26 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     from hermes_cli.left_core_migration import recover_for_provider
     recover_for_provider(requested_provider)  # a provider whose plugin left core: install it before resolving
     _raise_if_provider_disabled(requested_provider)
+    refs = active_shared_provider_refs(_FROZEN_RUNTIME_CONFIG.get())
+    if refs and requested_provider == "auto":
+        raise SharedProviderAuthError("A shared OAuth grant requires an explicit provider.", code="shared_provider_explicit_required")
+    if ref := refs.get(requested_provider):
+        model_cfg = _get_model_config()
+        if not ((requested and requested.strip()) or model_cfg.get("provider")):
+            raise SharedProviderAuthError("A shared OAuth grant requires an explicit provider.",
+                                          provider=requested_provider, code="shared_provider_explicit_required")
+        if (explicit_api_key or (explicit_base_url or "").rstrip("/") not in {"", DEFAULT_CODEX_BASE_URL}
+                or str(model_cfg.get("base_url") or "").rstrip("/") not in {"", DEFAULT_CODEX_BASE_URL}
+                or model_cfg.get("api_mode") not in (None, "", "codex_responses")
+                or _maybe_apply_codex_app_server_runtime(provider=requested_provider, api_mode="codex_responses",
+                    model_cfg=model_cfg, requested_provider=requested_provider) != "codex_responses"):
+            raise SharedProviderAuthError("A shared OAuth grant requires its native provider endpoint and transport.",
+                                          provider=requested_provider, code="shared_provider_route_mismatch")
+        from hermes_cli.auth_codex import resolve_shared_codex_runtime
+        credentials = resolve_shared_codex_runtime(ref)
+        return _runtime(requested_provider, "codex_responses", credentials["base_url"], credentials["api_key"],
+                        source=credentials["source"], requested_provider=requested_provider,
+                        last_refresh=credentials["last_refresh"])
     # Same alias expansion the auxiliary client applies, so ``provider: openai`` means one thing on
     # every path (background review, curator, MoA slots, delegation) instead of "Unknown provider".
     # The pre-expansion name is what the codex_app_server overlay judges: ``openai`` is eligible,
@@ -1291,6 +1312,9 @@ def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, targe
     if not explicit_base_url and not explicit_api_key:
         yield _local_endpoint_bypass(requested_provider, explicit_api_key, explicit_base_url)
     provider = resolve_provider(requested_provider, explicit_api_key=explicit_api_key, explicit_base_url=explicit_base_url)
+    if provider != requested_provider and provider in active_shared_provider_refs(_FROZEN_RUNTIME_CONFIG.get()):
+        raise SharedProviderAuthError("Use the exact provider ID for a shared OAuth grant.",
+                                      provider=provider, code="shared_provider_explicit_required")
     model_cfg = _get_model_config()
     yield _resolve_explicit_runtime(provider=provider, requested_provider=requested_provider, model_cfg=model_cfg,
                                     explicit_api_key=explicit_api_key, explicit_base_url=explicit_base_url,
@@ -1347,11 +1371,14 @@ def resolve_runtime_with_fallback(config: Optional[dict[str, Any]], *, requested
         return resolve_runtime_provider(requested=requested, target_model=target_model,
                                         explicit_base_url=explicit_base_url, explicit_api_key=explicit_api_key), None
     except AuthError as primary_exc:
+        if isinstance(primary_exc, SharedProviderAuthError):
+            raise
+        shared_providers = active_shared_provider_refs(_FROZEN_RUNTIME_CONFIG.get())
         from hermes_cli.fallback_config import effective_runtime_provider, fallback_entry_runtime_kwargs, get_fallback_chain
         for entry in get_fallback_chain(config):
             provider = (entry.get("provider") or "").strip().lower()
             model = (entry.get("model") or "").strip()
-            if not provider or not model:
+            if not provider or not model or provider in shared_providers:
                 continue
             try:
                 runtime = resolve_runtime_provider(**fallback_entry_runtime_kwargs(entry))

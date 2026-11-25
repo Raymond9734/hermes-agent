@@ -525,6 +525,16 @@ def _is_free_tier_entry(entry) -> bool:
 
 def auth_list_command(args) -> None:
     provider_filter = _normalize_provider(getattr(args, "provider", "") or "")
+    if getattr(args, "shareable", False):
+        if provider_filter != "openai-codex":
+            raise SystemExit("Use `hermes auth list openai-codex --shareable` in the main profile.")
+        from hermes_cli.auth_codex import list_shareable_codex_grants
+        refs = list_shareable_codex_grants()
+        for ref in refs:
+            print(f"id={ref.credential_id} account_id={ref.account_id} subject={ref.subject}")
+        if not refs:
+            print("No eligible persisted main-profile Codex OAuth rows.")
+        return
     if provider_filter:
         providers = [provider_filter]
     else:

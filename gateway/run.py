@@ -2836,8 +2836,23 @@ def _load_gateway_config(config_path: Path | None = None) -> dict:
     """
     if config_path is None:
         config_path = _gateway_config_home() / 'config.yaml'
+    from hermes_cli.config_backend import ConfigBackendUnavailable
+    from hermes_cli.config_effective import load_user_config_effective
+    from hermes_constants import profile_name_for_home
+    profile = profile_name_for_home(config_path.parent)
+    if profile is not None and profile != 'default':
+        try:
+            return load_user_config_effective(config_path, fail_closed=True)
+        except (Exception, ConfigBackendUnavailable):
+            # Never freeze recovered auth as new authorization. Other last-good
+            # settings may keep the owner UI usable while the file is repaired.
+            try:
+                recovered = load_user_config_effective(config_path)
+            except (Exception, ConfigBackendUnavailable):
+                recovered = {}
+            return {**recovered, 'auth': {'inherit_root_credentials': False, 'adopt_external_logins': False,
+                                         'shared_providers': None}}
     try:
-        from hermes_cli.config_effective import load_user_config_effective
         return load_user_config_effective(config_path)
     except Exception:
         logger.debug("Could not load gateway config from %s", config_path, exc_info=True)

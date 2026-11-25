@@ -38,6 +38,8 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
     auth_add.add_argument("--ca-bundle", help="Custom CA bundle for OAuth login")
     auth_list = auth_subparsers.add_parser("list", help="List pooled credentials")
     auth_list.add_argument("provider", nargs="?", help="Optional provider filter")
+    auth_list.add_argument("--shareable", action="store_true",
+                           help="List only eligible main-profile Codex OAuth reference IDs; no refresh or writes")
     auth_remove = auth_subparsers.add_parser(
         "remove", help="Remove a pooled credential by index, id, or label")
     auth_remove.add_argument("provider", help="Provider id")
