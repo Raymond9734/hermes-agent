@@ -649,7 +649,7 @@ def _shared_codex_row(store: dict[str, Any], ref: SharedProviderRef) -> dict[str
 def list_shareable_codex_grants() -> list[SharedProviderRef]:
     """Main-profile metadata only: don't seed, adopt, heal, or refresh a pool."""
     from agent.credential_pool import _codex_principal_identity
-    from hermes_cli.auth import _auth_file_path, _load_auth_store
+    from hermes_cli.auth import _auth_file_path, _load_auth_store, _load_provider_state
     from hermes_cli.auth_shared_providers import valid_reference_id
     from hermes_constants import get_default_hermes_root, get_hermes_home
 
@@ -660,10 +660,17 @@ def list_shareable_codex_grants() -> list[SharedProviderRef]:
     except (OSError, ValueError, TypeError):
         raise _shared_codex_unavailable() from None
     refs = []
+    singleton = (_load_provider_state(store, "openai-codex") or {}).get("tokens")
+    singleton_principal = (_codex_principal_identity(singleton.get("access_token"))
+                           if isinstance(singleton, dict) else None)
     for row in _codex_pool_dicts(_pool_entries(store, "openai-codex")):
         principal = _codex_principal_identity(row.get("access_token"))
         credential_id = row.get("id")
         if not valid_reference_id(credential_id) or principal is None or not all(map(valid_reference_id, principal)):
+            continue
+        # Same-principal manual device-code rows mirror the singleton. List its
+        # canonical persisted ID instead of presenting aliases as separate grants.
+        if row.get("source") == "manual:device_code" and principal == singleton_principal:
             continue
         ref = SharedProviderRef(credential_id, *principal)
         try:

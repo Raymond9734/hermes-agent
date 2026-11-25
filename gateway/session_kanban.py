@@ -45,13 +45,13 @@ def build_kanban_policy(connection, params, config):
             if (task is None or run is None or task.status != 'running' or run['status'] != 'running'
                     or task.current_run_id != params['run_id'] or run['task_id'] != task.id
                     or task.claim_lock != params['claim_lock'] or run['claim_lock'] != task.claim_lock):
-                raise AuthorityRefusal('stale_kanban_claim')
+                raise AuthorityRefusal('invalid_kanban_claim')
             if Path(resolve_profile_env(task.assignee)).resolve() != Path(authority.profile_id).resolve():
-                raise AuthorityRefusal('profile_mismatch')
+                raise AuthorityRefusal('invalid_kanban_claim')
             bound = conn.execute("SELECT payload FROM task_events WHERE task_id=? AND run_id=? AND kind='owner_admitted' ORDER BY id DESC LIMIT 1",
                                  (task.id, task.current_run_id)).fetchone()
             if bound and json.loads(bound[0])['request_id'] != 'kanban:' + json.dumps([board, task.id, task.current_run_id], separators=(',', ':')):
-                raise AuthorityRefusal('stale_kanban_claim')
+                raise AuthorityRefusal('invalid_kanban_claim')
             context = kb.build_worker_context(conn, task.id)
             required_plugin, runner_id = conn.execute('SELECT required_worker_plugin,worker_runner FROM tasks WHERE id=?', (task.id,)).fetchone()
             runner = _runner_pins(task, required_plugin, runner_id)

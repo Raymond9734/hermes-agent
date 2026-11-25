@@ -1235,10 +1235,17 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
     from hermes_cli.left_core_migration import recover_for_provider
     recover_for_provider(requested_provider)  # a provider whose plugin left core: install it before resolving
     _raise_if_provider_disabled(requested_provider)
-    refs = active_shared_provider_refs(_FROZEN_RUNTIME_CONFIG.get())
-    if refs and requested_provider == "auto":
-        raise SharedProviderAuthError("A shared OAuth grant requires an explicit provider.", code="shared_provider_explicit_required")
-    if ref := refs.get(requested_provider):
+    if requested_provider == "auto":
+        # An invalid share never authorizes Codex (the selected rung checks again
+        # below), but it must not suppress an unrelated profile-owned credential.
+        try:
+            refs = active_shared_provider_refs(_FROZEN_RUNTIME_CONFIG.get())
+        except SharedProviderAuthError:
+            refs = {}
+        if refs:
+            raise SharedProviderAuthError("A shared OAuth grant requires an explicit provider.", code="shared_provider_explicit_required")
+    if requested_provider == "openai-codex" and (
+            ref := active_shared_provider_refs(_FROZEN_RUNTIME_CONFIG.get()).get(requested_provider)):
         model_cfg = _get_model_config()
         if not ((requested and requested.strip()) or model_cfg.get("provider")):
             raise SharedProviderAuthError("A shared OAuth grant requires an explicit provider.",
@@ -1312,7 +1319,8 @@ def _ladder_rungs(requested_provider, explicit_api_key, explicit_base_url, targe
     if not explicit_base_url and not explicit_api_key:
         yield _local_endpoint_bypass(requested_provider, explicit_api_key, explicit_base_url)
     provider = resolve_provider(requested_provider, explicit_api_key=explicit_api_key, explicit_base_url=explicit_base_url)
-    if provider != requested_provider and provider in active_shared_provider_refs(_FROZEN_RUNTIME_CONFIG.get()):
+    if (provider == "openai-codex" and provider != requested_provider
+            and provider in active_shared_provider_refs(_FROZEN_RUNTIME_CONFIG.get())):
         raise SharedProviderAuthError("Use the exact provider ID for a shared OAuth grant.",
                                       provider=provider, code="shared_provider_explicit_required")
     model_cfg = _get_model_config()
@@ -1373,14 +1381,16 @@ def resolve_runtime_with_fallback(config: Optional[dict[str, Any]], *, requested
     except AuthError as primary_exc:
         if isinstance(primary_exc, SharedProviderAuthError):
             raise
-        shared_providers = active_shared_provider_refs(_FROZEN_RUNTIME_CONFIG.get())
+
         from hermes_cli.fallback_config import effective_runtime_provider, fallback_entry_runtime_kwargs, get_fallback_chain
         for entry in get_fallback_chain(config):
             provider = (entry.get("provider") or "").strip().lower()
             model = (entry.get("model") or "").strip()
-            if not provider or not model or provider in shared_providers:
+            if not provider or not model:
                 continue
             try:
+                if provider == "openai-codex" and provider in active_shared_provider_refs(_FROZEN_RUNTIME_CONFIG.get()):
+                    continue
                 runtime = resolve_runtime_provider(**fallback_entry_runtime_kwargs(entry))
             except AuthError as fb_exc:
                 logger.debug("Fallback entry %s/%s failed: %s", provider, model, fb_exc)
