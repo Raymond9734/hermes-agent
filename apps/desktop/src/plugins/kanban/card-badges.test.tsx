@@ -28,11 +28,12 @@ vi.mock('./api', async importOriginal => ({
   })),
   fetchBoard: vi.fn(async () => ({
     assignees: [],
+    board_slug: $boardSlug.get() || 'main',
     columns: [
       {
         name: 'ready',
         tasks: [
-          { id: 't_1a2b3c', status: 'ready', tenant: 'acme', title: 'Ship the acme report' },
+          { id: 't_1a2b3c', status: 'ready', tenant: 'acme', title: $boardSlug.get() === 'copy' ? 'Imported acme report' : 'Ship the acme report' },
           { id: 't_4d5e6f', status: 'ready', tenant: null, title: 'Untenanted chore' }
         ]
       }
@@ -114,5 +115,29 @@ describe('kanban board: plugin card badges', () => {
 
     expect(screen.queryByText('acme')).toBeNull()
     expect(container.querySelector('[data-slot="kanban-card-badges"]')).toBeNull()
+  })
+
+  it('distinguishes the server-default board from a different board with an imported copy of the same card', async () => {
+    const ctx = createPluginContext('board-identity-test')
+
+    const unload = ctx.register({
+      area: KANBAN_CARD_AREAS.badges,
+      id: 'identity',
+      data: {
+        decorate: (card, board) =>
+          card.id === 't_1a2b3c' && board.scope?.slug === 'main' ? { label: 'Main board only' } : null
+      } satisfies KanbanCardBadgeContribution
+    })
+
+    try {
+      renderBoard()
+      await screen.findByText('Main board only')
+      act(() => $boardSlug.set('copy'))
+      await screen.findByText('Imported acme report')
+      expect(screen.queryByText('Main board only')).toBeNull()
+      expect(within(tileOf('Imported acme report')).getByText('acme')).toBeTruthy()
+    } finally {
+      act(() => unload())
+    }
   })
 })

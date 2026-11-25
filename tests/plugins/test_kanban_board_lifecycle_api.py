@@ -52,6 +52,33 @@ def test_rename_board_keeps_slug(client):
     assert listed["name"] == "Gadget"
 
 
+def test_board_snapshot_identifies_the_rows_even_when_selection_is_implicit(client):
+    root = "/api/plugins/kanban"
+    client.post(f"{root}/boards", json={"slug": "widget"}).raise_for_status()
+    client.post(f"{root}/tasks?board=widget", json={"title": "Only on widget"}).raise_for_status()
+    kb.set_current_board("widget")
+
+    snapshot = client.get(f"{root}/board").raise_for_status().json()
+    assert snapshot["board_slug"] == "widget"
+    assert [task["title"] for lane in snapshot["columns"] for task in lane["tasks"]] == ["Only on widget"]
+
+    explicit = client.get(f"{root}/board?board=default").raise_for_status().json()
+    assert explicit["board_slug"] == "default"
+    assert not any(lane["tasks"] for lane in explicit["columns"])
+
+
+def test_board_snapshot_does_not_claim_board_identity_with_custom_db_pin(client, monkeypatch):
+    root = "/api/plugins/kanban"
+    client.post(f"{root}/boards", json={"slug": "widget"}).raise_for_status()
+    client.post(f"{root}/tasks?board=widget", json={"title": "Only on widget"}).raise_for_status()
+    kb.set_current_board("widget")
+    monkeypatch.setenv("HERMES_KANBAN_DB", str(kb.kanban_db_path(board="default")))
+
+    snapshot = client.get(f"{root}/board").raise_for_status().json()
+    assert "board_slug" not in snapshot
+    assert [task["title"] for lane in snapshot["columns"] for task in lane["tasks"]] == ["Only on widget"]
+
+
 def test_delete_board_archives_and_reverts_current(client):
     client.post("/api/plugins/kanban/boards", json={"slug": "widget", "name": "Widget"})
     client.post("/api/plugins/kanban/tasks?board=widget", json={"title": "do the thing"})

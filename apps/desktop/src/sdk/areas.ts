@@ -27,9 +27,12 @@ export {
   type KanbanCardBadge,
   type KanbanCardBadgeContribution,
   type KanbanCardBadgeHue,
+  type KanbanCardBadgeObserverProps,
+  KanbanCardBadgeProvider,
   KanbanCardBadges,
   type KanbanCardBadgeTone,
-  type KanbanCardBoard
+  type KanbanCardBoard,
+  type KanbanCardBoardScope
 } from '@/contrib/kanban-card-badges'
 /** Draw the `MEDIA:` files your package's OWN tools produced, in place of the
  *  built-in player (ownership is checked against the backend's tool registry). */

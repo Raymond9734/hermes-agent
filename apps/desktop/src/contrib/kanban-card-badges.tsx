@@ -1,6 +1,20 @@
 import { useStore } from '@nanostores/react'
-import { type CSSProperties, type ReactElement, useMemo } from 'react'
+import {
+  type ComponentType,
+  createContext,
+  type CSSProperties,
+  type ReactElement,
+  type ReactNode,
+  useCallback,
+  useContext,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState
+} from 'react'
 
+import { getApiRequestConnection, getApiRequestProfile } from '@/api/client'
+import { ErrorBoundary } from '@/components/error-boundary'
 import { Tip } from '@/components/ui/tooltip'
 import { PROFILE_SWATCHES } from '@/lib/profile-color'
 import { cn } from '@/lib/utils'
@@ -60,9 +74,17 @@ export interface KanbanCard {
 
 /** Board-level facts every card on the board shares. Frozen. */
 export interface KanbanCardBoard {
+  /** Identity of the rendered snapshot; absent when the gateway cannot prove it. */
+  readonly scope?: KanbanCardBoardScope
   /** Every tenant on the board (the list its filter menu offers), so a plugin
    *  can give each one a distinct color instead of hashing blind. */
   readonly tenants: readonly string[]
+}
+
+export interface KanbanCardBoardScope {
+  readonly connectionId: string
+  readonly profile: string
+  readonly slug: string
 }
 
 export interface KanbanCardBadge {
@@ -80,10 +102,100 @@ export interface KanbanCardBadge {
  *  badges, or `null` for cards you have nothing to say about. Keep it a pure
  *  lookup: it runs while the board renders. */
 export interface KanbanCardBadgeContribution {
-  decorate: (
-    card: KanbanCard,
-    board: KanbanCardBoard
-  ) => KanbanCardBadge | null | readonly KanbanCardBadge[] | undefined
+  decorate: Decorate
+  /** Optional headless component, mounted once per populated board scope. */
+  observeBoard?: ComponentType<KanbanCardBadgeObserverProps>
+}
+
+type Decorate = (card: KanbanCard, board: KanbanCardBoard) => KanbanCardBadge | null | readonly KanbanCardBadge[] | undefined
+
+export interface KanbanCardBadgeObserverProps {
+  readonly scope: KanbanCardBoardScope
+  /** Whether plugin REST still routes to this observer's connection and profile. */
+  isCurrent: () => boolean
+  /** Publish a pure lookup, or null to fall back to the static decorator. */
+  publish: (decorate: Decorate | null) => void
+}
+
+interface PublishedDecorator {
+  scope: KanbanCardBoardScope
+  decorate: Decorate
+}
+
+type Published = ReadonlyMap<Contribution, PublishedDecorator>
+const BoardContext = createContext<{ scope?: KanbanCardBoardScope; published: Published } | null>(null)
+
+interface BoardObserverProps {
+  contribution: Contribution
+  scope: KanbanCardBoardScope
+  onPublish: (contribution: Contribution, scope: KanbanCardBoardScope, decorate: Decorate | null) => void
+}
+
+function BoardObserver({ contribution, scope, onPublish }: BoardObserverProps) {
+  const Observer = (contribution.data as Partial<KanbanCardBadgeContribution>)?.observeBoard
+  const mounted = useRef(false)
+  useLayoutEffect(() => {
+    mounted.current = true
+
+    return () => {
+      mounted.current = false
+      onPublish(contribution, scope, null)
+    }
+  }, [contribution, onPublish, scope])
+
+  const isCurrent = useCallback(() => (
+    (getApiRequestConnection() ?? 'local') === scope.connectionId &&
+    (getApiRequestProfile() ?? 'default') === scope.profile
+  ), [scope])
+
+  const publish = useCallback((decorate: Decorate | null) => {
+    if (mounted.current) {
+      onPublish(contribution, scope, decorate)
+    }
+  }, [contribution, onPublish, scope])
+
+  return Observer ? <Observer isCurrent={isCurrent} publish={publish} scope={scope} /> : null
+}
+
+/** Native board hosts supply the identity of the snapshot they render. */
+export function KanbanCardBadgeProvider({ children, scope }: { children: ReactNode; scope?: KanbanCardBoardScope }) {
+  const contributions = useContributions(KANBAN_CARD_AREAS.badges)
+  const [published, setPublished] = useState<Published>(() => new Map())
+
+  const onPublish = useCallback((contribution: Contribution, scope: KanbanCardBoardScope, decorate: Decorate | null) => {
+    setPublished(previous => {
+      const current = previous.get(contribution)
+
+      if (decorate ? current?.scope === scope && current.decorate === decorate : current?.scope !== scope) {
+        return previous
+      }
+
+      const next = new Map(previous)
+
+      if (decorate) {
+        next.set(contribution, { scope, decorate })
+      } else {
+        next.delete(contribution)
+      }
+
+      return next
+    })
+  }, [])
+
+  const value = useMemo(() => ({ scope, published }), [scope, published])
+
+  return (
+    <BoardContext.Provider value={value}>
+      {scope && contributions.map(contribution => (
+        (contribution.data as Partial<KanbanCardBadgeContribution> | undefined)?.observeBoard && (
+          <ErrorBoundary fallback={() => null} key={JSON.stringify([contribution.id, scope])} label={`contrib:${contribution.id}`}>
+            <BoardObserver contribution={contribution} onPublish={onPublish} scope={scope} />
+          </ErrorBoundary>
+        )
+      ))}
+      {children}
+    </BoardContext.Provider>
+  )
 }
 
 export interface ResolvedKanbanCardBadge {
@@ -157,7 +269,8 @@ const warned = new Set<string>()
 export function resolveKanbanCardBadges(
   contributions: readonly Contribution[],
   card: KanbanCard,
-  board: KanbanCardBoard
+  board: KanbanCardBoard,
+  published?: Published
 ): ResolvedKanbanCardBadge[] {
   const view: KanbanCard = Object.freeze({
     assignee: card.assignee ?? null,
@@ -166,7 +279,10 @@ export function resolveKanbanCardBadges(
     tenant: card.tenant ?? null
   })
 
-  const boardView: KanbanCardBoard = Object.freeze({ tenants: Object.freeze([...board.tenants]) })
+  const boardView: KanbanCardBoard = Object.freeze({
+    ...(board.scope ? { scope: Object.freeze({ ...board.scope }) } : {}),
+    tenants: Object.freeze([...board.tenants])
+  })
 
   const used = new Map<string, number>()
   const badges: ResolvedKanbanCardBadge[] = []
@@ -180,10 +296,12 @@ export function resolveKanbanCardBadges(
     }
 
     try {
-      const answer = (contribution.data as Partial<KanbanCardBadgeContribution> | undefined)?.decorate?.(
-        view,
-        boardView
-      )
+      const observed = published?.get(contribution)
+      const data = contribution.data as Partial<KanbanCardBadgeContribution> | undefined
+
+      const answer = observed && observed.scope === board.scope
+        ? observed.decorate(view, boardView)
+        : data?.decorate?.(view, boardView)
 
       const list: readonly unknown[] = Array.isArray(answer) ? answer : answer ? [answer] : []
 
@@ -234,12 +352,15 @@ const pluginName = (source: string, records: ReturnType<typeof $pluginRecords.ge
  *  no plugin has a badge for this card, so an unused area costs no space. */
 export function KanbanCardBadges({ card, tenants }: KanbanCardBadgesProps): null | ReactElement {
   const contributions = useContributions(KANBAN_CARD_AREAS.badges)
+  const context = useContext(BoardContext)
+  const scope = context?.scope
+  const published = context?.published
   const records = useStore($pluginRecords)
   const { assignee = null, id, status, tenant = null } = card
 
   const badges = useMemo(
-    () => resolveKanbanCardBadges(contributions, { assignee, id, status, tenant }, { tenants }),
-    [assignee, contributions, id, status, tenant, tenants]
+    () => resolveKanbanCardBadges(contributions, { assignee, id, status, tenant }, { scope, tenants }, published),
+    [assignee, contributions, id, published, scope, status, tenant, tenants]
   )
 
   if (badges.length === 0) {

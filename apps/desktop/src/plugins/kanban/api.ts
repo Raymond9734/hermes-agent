@@ -153,10 +153,6 @@ function eventsUrl(slug: string, since: number | undefined): string {
   return query ? `/events?${query}` : '/events'
 }
 
-function boardSnapshotPath(slug: string): string {
-  return slug ? `/board?board=${encodeURIComponent(slug)}` : '/board'
-}
-
 /** Cache-scope id for the active connection — the segment every query key
  *  embeds. `'local'` covers the pre-descriptor null; the SDK atom already
  *  reports 'local' for the local pool. For NON-rendering code (mutations,
@@ -183,6 +179,9 @@ const routedScope = (): string => host.activeConnectionId() ?? LOCAL_SCOPE
  *  would paint on the way back. Installed as the `['kanban']` query default in
  *  `bindApi`; sites with their own `enabled` compose it. */
 export const routedToScope = (query: { queryKey: readonly unknown[] }): boolean => query.queryKey[2] === routedScope()
+
+export const boardReadIsCurrent = (scope: string, slug: string, profile: string): boolean =>
+  routedScope() === scope && kanbanConnectionScope() === scope && host.state.profile.get() === profile && $boardSlug.get() === slug
 
 /** One live `task_events` frame → precise cache invalidation: the board, plus
  *  each touched task's detail. The polls (8s board / 4s drawer) stay as the
@@ -295,7 +294,7 @@ export function bindApi(
       // with no since — the server starts at the tail rather than replaying.
       void queryClient
         .fetchQuery({
-          queryFn: () => r<KanbanBoard>(boardSnapshotPath(slug)),
+          queryFn: () => fetchBoard(false, slug),
           queryKey: boardKey(scope, slug, false)
         })
         .then(board => {
@@ -396,9 +395,8 @@ function call<T>(path: string, opts?: PluginRestOptions): Promise<T> {
 }
 
 /** Append the selected board (and other params) to a path. */
-function withBoard(path: string, params: Record<string, string> = {}): string {
+function withBoard(path: string, params: Record<string, string> = {}, slug = $boardSlug.get()): string {
   const search = new URLSearchParams(params)
-  const slug = $boardSlug.get()
 
   if (slug) {
     search.set('board', slug)
@@ -414,8 +412,8 @@ function withBoard(path: string, params: Record<string, string> = {}): string {
 /** Prefix matching every board query on one connection (all slugs, both
  *  archived views) — the mutation-settled invalidation target. */
 export const boardKeyPrefix = (scope: string) => ['kanban', 'board', scope] as const
-export const boardKey = (scope: string, slug: string, archived: boolean) =>
-  [...boardKeyPrefix(scope), slug, archived] as const
+export const boardKey = (scope: string, slug: string, archived: boolean, profile = host.state.profile.get()) =>
+  [...boardKeyPrefix(scope), slug, archived, profile] as const
 export const taskKey = (scope: string, slug: string, id: string) => ['kanban', 'task', scope, slug, id] as const
 export const logKey = (scope: string, slug: string, id: string) => ['kanban', 'log', scope, slug, id] as const
 export const boardsKey = (scope: string) => ['kanban', 'boards', scope] as const
@@ -425,8 +423,8 @@ export const orchestrationKey = (scope: string) => ['kanban', 'orchestration', s
 
 // ── reads ─────────────────────────────────────────────────────────────────────
 
-export const fetchBoard = (archived: boolean) =>
-  call<KanbanBoard>(withBoard('/board', archived ? { include_archived: 'true' } : {}))
+export const fetchBoard = (archived: boolean, slug = $boardSlug.get()) =>
+  call<KanbanBoard>(withBoard('/board', archived ? { include_archived: 'true' } : {}, slug))
 
 export const fetchTask = async (id: string) => {
   const downloadAttachment = captureGatewayFileDownload()

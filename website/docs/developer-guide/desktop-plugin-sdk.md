@@ -877,6 +877,7 @@ interface KanbanCard {            // frozen; identity and routing fields only
 }
 interface KanbanCardBoard {       // frozen; shared by every card on the board
   tenants: readonly string[]      // every tenant on the board (its filter menu's list)
+  scope?: Readonly<{ connectionId: string; profile: string; slug: string }>
 }
 interface KanbanCardBadge {
   label: string                   // plain text
@@ -902,6 +903,23 @@ ctx.register({
 has nothing to say about. The card view carries no prose (title, body, summaries,
 comments, run output); look up anything else you need by `id` in your own data
 (`ctx.rest` to your backend, `ctx.storage`). Both views are frozen.
+
+`board.scope` identifies the snapshot the native board actually rendered,
+including server-default selection. It may be absent (for example, on older
+gateways or with a custom database pin). For board-specific data, return `null`
+when scope is absent or does not match. A task ID may be preserved by a native
+board import and is not sufficient to identify a board.
+
+**Board-scoped reads.** For dynamic badges, optionally provide
+`data.observeBoard`, a headless React component receiving
+`KanbanCardBadgeObserverProps`. It mounts once for each contribution on the
+populated board, only if the snapshot has a verified scope, and unmounts when
+that scope changes or the plugin unloads. Return `null` from the component;
+call `publish(decorate)` from an effect to substitute a pure decorator for
+the current board, or `publish(null)` to revert to the static `data.decorate`.
+Use the scoped query key `(connectionId, profile, slug)`, check `isCurrent()`
+before and after asynchronous reads through `ctx.rest`, and clear the published
+decorator on error. Older renderers simply use `data.decorate`.
 
 **What the board accepts** (`KANBAN_CARD_BADGE_LIMITS`):
 
@@ -929,7 +947,7 @@ the row still paints.
 
 **Updates and teardown.** `decorate()` re-runs when the registry changes,
 when the card's id, status, tenant or assignee changes, or when the board's
-tenant list changes, so keep it a pure lookup. When your own data changes (a user pins a new color in your settings
+tenant list or scope changes, so keep it a pure lookup. When your own data changes (a user pins a new color in your settings
 page), call `ctx.register` again with the same `id`: the new registration
 replaces the old one and the board repaints. Keep the latest disposer; the
 first one would remove the replacement. On disable, reload or unload, the

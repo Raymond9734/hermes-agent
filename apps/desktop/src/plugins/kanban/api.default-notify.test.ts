@@ -15,7 +15,7 @@ vi.mock('@hermes/plugin-sdk', async () => {
   return {
     atom,
     queryClient: new QueryClient({ defaultOptions: { queries: { retry: false } } }),
-    host: { ...doors, state: { connectionId }, activeConnectionId: () => connectionId.get() },
+    host: { ...doors, state: { connectionId, profile: atom('default') }, activeConnectionId: () => connectionId.get() },
     useValue: vi.fn(),
     usePluginI18n: vi.fn(),
     captureGatewayFileDownload: vi.fn()

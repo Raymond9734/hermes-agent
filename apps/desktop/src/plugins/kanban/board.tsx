@@ -34,6 +34,7 @@ import {
   host,
   Input,
   isSubmitEnter,
+  KanbanCardBadgeProvider,
   KanbanCardBadges,
   Loader,
   SearchField,
@@ -69,6 +70,7 @@ import {
   $lanesByProfile,
   boardKey,
   boardKeyPrefix,
+  boardReadIsCurrent,
   boardsKey,
   bulkTasks,
   createTask,
@@ -1103,16 +1105,28 @@ export function KanbanBoardPage() {
   const k = useKanban()
   const qc = useQueryClient()
   const scope = useKanbanScope()
+  const profile = useValue(host.state.profile)
   const slug = useValue($boardSlug)
   const [archived, setArchived] = useState(false)
+  const key = boardKey(scope, slug, archived, profile)
 
   // Live updates ride the events socket (bindApi); this interval is only the
   // slow heartbeat for socketless paths (OAuth remotes, dropped connections).
   const { data: board, error } = useQuery({
-    queryFn: () => fetchBoard(archived),
-    queryKey: boardKey(scope, slug, archived),
+    enabled: () => boardReadIsCurrent(scope, slug, profile),
+    queryFn: () => fetchBoard(archived, slug),
+    queryKey: key,
     refetchInterval: 60_000
   })
+
+  const renderedSlug = typeof board?.board_slug === 'string' && (!slug || slug === board.board_slug)
+    ? board.board_slug
+    : undefined
+
+  const badgeScope = useMemo(
+    () => renderedSlug ? Object.freeze({ connectionId: scope, profile, slug: renderedSlug }) : undefined,
+    [profile, renderedSlug, scope]
+  )
 
   const [openId, setOpenId] = useState<null | string>(null)
   const [addStatus, setAddStatus] = useState<null | string>(null)
@@ -1209,18 +1223,18 @@ export function KanbanBoardPage() {
   const moveMut = useMutation({
     mutationFn: ({ id, status }: { id: string; status: string }) => patchTask(id, { status }),
     onMutate: async ({ id, status }) => {
-      await qc.cancelQueries({ queryKey: boardKey(scope, slug, archived) })
-      const previous = qc.getQueryData<KanbanBoard>(boardKey(scope, slug, archived))
+      await qc.cancelQueries({ queryKey: key })
+      const previous = qc.getQueryData<KanbanBoard>(key)
 
       if (previous) {
-        qc.setQueryData(boardKey(scope, slug, archived), moveCard(previous, id, status))
+        qc.setQueryData(key, moveCard(previous, id, status))
       }
 
       return { previous }
     },
     onError: (err, _vars, context) => {
       if (context?.previous) {
-        qc.setQueryData(boardKey(scope, slug, archived), context.previous)
+        qc.setQueryData(key, context.previous)
       }
 
       host.notify({ kind: 'error', message: errText(err) })
@@ -1234,18 +1248,18 @@ export function KanbanBoardPage() {
   const deleteMut = useMutation({
     mutationFn: (id: string) => deleteTask(id),
     onMutate: async id => {
-      await qc.cancelQueries({ queryKey: boardKey(scope, slug, archived) })
-      const previous = qc.getQueryData<KanbanBoard>(boardKey(scope, slug, archived))
+      await qc.cancelQueries({ queryKey: key })
+      const previous = qc.getQueryData<KanbanBoard>(key)
 
       if (previous) {
-        qc.setQueryData(boardKey(scope, slug, archived), removeCard(previous, id))
+        qc.setQueryData(key, removeCard(previous, id))
       }
 
       return { previous }
     },
     onError: (err, _id, context) => {
       if (context?.previous) {
-        qc.setQueryData(boardKey(scope, slug, archived), context.previous)
+        qc.setQueryData(key, context.previous)
       }
 
       host.notify({ kind: 'error', message: errText(err) })
@@ -1413,27 +1427,29 @@ export function KanbanBoardPage() {
           onMouseDown={onMouseDown}
           ref={lanesRef}
         >
-          {filtered.columns.map(col => {
-            const auto = boardHasWork && col.tasks.length === 0
+          <KanbanCardBadgeProvider scope={badgeScope}>
+            {filtered.columns.map(col => {
+              const auto = boardHasWork && col.tasks.length === 0
 
-            return (
-              <Column
-                collapsed={laneOverrides[col.name] ?? auto}
-                column={col}
-                columns={columnNames}
-                key={col.name}
-                onAdd={setAddStatus}
-                onDelete={id => deleteMut.mutate(id)}
-                onDropTask={onMove}
-                onMove={onMove}
-                onOpen={setOpenId}
-                onToggle={() => toggleLane(col.name, auto)}
-                onToggleSelect={toggleSelect}
-                selected={selected}
-                tenants={filtered.tenants}
-              />
-            )
-          })}
+              return (
+                <Column
+                  collapsed={laneOverrides[col.name] ?? auto}
+                  column={col}
+                  columns={columnNames}
+                  key={col.name}
+                  onAdd={setAddStatus}
+                  onDelete={id => deleteMut.mutate(id)}
+                  onDropTask={onMove}
+                  onMove={onMove}
+                  onOpen={setOpenId}
+                  onToggle={() => toggleLane(col.name, auto)}
+                  onToggleSelect={toggleSelect}
+                  selected={selected}
+                  tenants={filtered.tenants}
+                />
+              )
+            })}
+          </KanbanCardBadgeProvider>
         </div>
       )}
 

@@ -42,6 +42,8 @@ export interface KanbanColumn {
 }
 
 export interface KanbanBoard {
+  /** Missing on older gateways that do not identify the snapshot. */
+  board_slug?: string
   columns: KanbanColumn[]
   tenants: string[]
   assignees: string[]

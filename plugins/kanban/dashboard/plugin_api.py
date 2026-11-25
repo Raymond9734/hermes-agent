@@ -13,6 +13,7 @@ import asyncio
 import importlib
 import json
 import logging
+import os
 import re
 import sqlite3
 import time
@@ -293,6 +294,9 @@ def get_board(
     current_step_key: Optional[str] = Query(None, description="Restrict to tasks at this workflow step key")):
     """Full board grouped by status column; omitting ``board`` uses the active board
     (``HERMES_KANBAN_BOARD`` env → on-disk ``current`` pointer → ``default``)."""
+    # Preserve custom DB pins. In that case a logical slug alone cannot
+    # identify the file backing the rendered rows.
+    pinned_db = bool(os.environ.get("HERMES_KANBAN_DB", "").strip())
     with _board_conn(board) as (board, conn):
         tasks = kanban_db.list_tasks(
             conn, tenant=tenant, include_archived=include_archived,
@@ -347,6 +351,7 @@ def get_board(
         # which already uses this helper.
         assignees = [entry["name"] for entry in kanban_db.known_assignees(conn)]
         return {
+            **({"board_slug": board} if not pinned_db and board else {}),
             "columns": [{"name": name, "tasks": columns[name]} for name in columns], "tenants": tenants,
             "assignees": assignees, "latest_event_id": int(latest_event_id), "now": int(time.time())}
 
