@@ -753,12 +753,9 @@ def _get_hermes_oauth_file() -> Path:
 def _root_hermes_oauth_file() -> Optional[Path]:
     """Global-root ``.anthropic_oauth.json`` inside a named profile (None in classic mode); used to commit a
     rotation of a grant the profile borrowed via the pool's root fallback."""
-    try:
-        from hermes_constants import get_default_hermes_root
-        root = get_default_hermes_root()
-        return None if root.resolve(strict=False) == get_hermes_home().resolve(strict=False) else root / ".anthropic_oauth.json"
-    except Exception:
-        return None
+    from hermes_cli.auth import _global_auth_file_path
+    path = _global_auth_file_path()
+    return path.with_name(".anthropic_oauth.json") if path is not None else None
 
 
 def _generate_pkce() -> tuple:

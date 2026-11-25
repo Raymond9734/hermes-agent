@@ -491,16 +491,26 @@ def _auth_file_path() -> Path:
     return path
 
 
-def _global_auth_file_path() -> Optional[Path]:
-    """Global-root auth.json in profile mode; None when profile and global root are the same dir.
-
-    Read-only fallback path, so no pytest seat belt here (it lives on ``_auth_file_path()``)."""
+def _root_auth_path_for_profile() -> Optional[Path]:
+    """Root auth.json for a named profile, irrespective of its borrowing policy."""
     try:
         from hermes_constants import get_default_hermes_root
         global_root = get_default_hermes_root()
     except Exception:
         return None
     return None if _same_path(get_hermes_home(), global_root) else global_root / "auth.json"
+
+
+def _global_auth_file_path() -> Optional[Path]:
+    """Root source for fallback reads and borrowed-grant refreshes, if the profile allows them."""
+    path = _root_auth_path_for_profile()
+    if path is None:
+        return None
+    from hermes_cli.config import load_config_readonly
+    auth = load_config_readonly().get("auth")
+    if isinstance(auth, dict) and auth.get("inherit_root_credentials", True) is not True:
+        return None
+    return path
 
 
 def _load_global_auth_store() -> dict[str, Any]:
@@ -936,8 +946,8 @@ def is_runtime_provider_routable(provider_id: str) -> bool:
 def read_credential_pool(provider_id: Optional[str] = None) -> dict[str, Any]:
     """Return the persisted credential pool, or one provider slice.
 
-    In profile mode the global-root ``auth.json`` is a read-only fallback applied per provider ONLY
-    when the profile has zero entries for it (``hermes auth add`` in the profile shadows global)."""
+    By default the global-root ``auth.json`` is a read-only fallback applied per provider when the
+    profile has zero rows for it. ``auth.inherit_root_credentials: false`` disables that fallback."""
     pool = _load_auth_store().get("credential_pool")
     pool = pool if isinstance(pool, dict) else {}
     global_pool = _load_global_auth_store().get("credential_pool")
