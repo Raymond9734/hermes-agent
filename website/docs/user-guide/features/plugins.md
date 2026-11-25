@@ -128,6 +128,7 @@ Every `ctx.*` API below is available inside a plugin's `register(ctx)` function.
 | Register a memory backend | Subclass `MemoryProvider` in `plugins/memory/<name>/__init__.py` — see [Memory Provider Plugins](../../developer-guide/memory-provider-plugin.md) (uses a separate discovery system) |
 | Run a host-owned LLM call | `ctx.llm.complete(...)` / `ctx.llm.complete_structured(...)` — borrow the user's active model + auth for a one-shot completion with optional JSON schema validation. See [Plugin LLM Access](../../developer-guide/plugin-llm-access.md) |
 | Call an MCP tool (capability-gated) | `ctx.call_mcp(server, tool, arguments, timeout=30)` — see [Calling MCP servers from plugins](#calling-mcp-servers-from-plugins) |
+| Call one explicitly granted MCP tool, without callbacks | `ctx.call_mcp_scoped(server, tool, arguments, timeout=30)` — see [Exact-tool scope](#exact-tool-scope) |
 | Register an inference backend (LLM provider) | `register_provider(ProviderProfile(...))` in `plugins/model-providers/<name>/__init__.py` — see [Model Provider Plugins](../../developer-guide/model-provider-plugin.md) (uses a separate discovery system) |
 
 :::note Slash command handlers run in the gateway
@@ -1309,5 +1310,31 @@ plugins:
 :::warning
 Granting `mcp_allowlist` gives the plugin the same access to that MCP server as the model has — including any write-capable tools the server exposes (subject to the server's `trust` tier gates). Grant only servers the plugin genuinely needs.
 :::
+
+### Exact-tool scope
+
+Use `ctx.call_mcp_scoped(server, tool, arguments=None, *, timeout=30)` when an enabled plugin needs only a fixed set of tools from a configured Streamable HTTP connector. Declare the **exact remote names** in the plugin's `plugin.yaml`:
+
+```yaml
+mcp_scopes:
+  knowledge_rag: [query_knowledge]
+```
+
+The operator grants the same set in the owning profile's `config.yaml`:
+
+```yaml
+plugins:
+  enabled: [my-plugin]
+  entries:
+    my-plugin:
+      mcp_scoped_allowlist:
+        knowledge_rag: [query_knowledge]
+```
+
+The declaration alone grants nothing. A missing or mismatched grant, disabled connector, alias, or unlisted tool is denied before connecting. Do not also give this plugin `mcp_allowlist` access to that connector. `mcp_servers.<server>.tools.include` controls ordinary tool registration, not this grant.
+
+Hermes opens and closes a separate native session per call. It uses the existing connector's authorization in the plugin's owning profile. A valid cached OAuth token needs no metadata discovery. An expired token can refresh only at the endpoint in the cached metadata for its recorded issuer; missing or mismatched metadata fails closed. Scoped calls do not follow redirects, initiate login, request more OAuth scopes, or replay a rejected call. Sampling and elicitation are neither advertised nor handled. Ordinary chats and `ctx.call_mcp` keep their existing registration and sessions. Scoped calls do not spawn stdio connectors, fall back to legacy SSE, or use costed connectors. Untrusted tools that would require approval are refused.
+
+A successful, untruncated response has the usual text/structured envelope and a host-generated `scope`: `{plugin, server, tools, sampling: false, elicitation: false}`. `tools` is the sorted, granted set, not the remote list of tools. A receipt verifies the Hermes call scope, not the contents of the response, credential permissions at the server, or the side effects of a remote tool. This is a boundary on SDK calls, not a sandbox for arbitrary Python plugin code.
 
 See the **[full guide](../../developer-guide/plugins/index.md)** for handler contracts, schema format, hook behavior, error handling, and common mistakes.

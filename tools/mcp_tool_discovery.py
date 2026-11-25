@@ -126,7 +126,7 @@ def _owner_secret_mapping(home: Path) -> dict[str, str]:
 
 
 @contextmanager
-def _owner_secret_scope():
+def _owner_secret_scope(home: Optional[Path] = None):
     """Sync twin of :func:`_install_owner_secret_scope` for the config load in the caller's thread.
 
     ``_load_mcp_config`` interpolates ``${VAR}`` header/URL refs through ``get_secret`` and swallows
@@ -134,7 +134,7 @@ def _owner_secret_scope():
     probe for a routed profile saw ZERO servers — stdio siblings included — before the connect-site
     binding could ever run (#113746). Same owner rule; scope key ``None`` binds nothing."""
     from agent.secret_scope import reset_secret_scope, set_secret_scope
-    home = _owner_scope_home()
+    home = home if home is not None else _owner_scope_home()
     if home is None:
         yield
         return

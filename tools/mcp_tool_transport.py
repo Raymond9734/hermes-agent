@@ -166,6 +166,8 @@ def _sdk_unavailable_error(server_name: str) -> ImportError:
 class MCPServerTransportMixin:
     """Methods of :class:`tools.mcp_tool.MCPServerTask` (mixed in; relies on its attributes)."""
 
+    name: str
+
     def _advertises_tools(self) -> bool:
         """False only when captured capabilities omit ``tools`` (prompt-/resource-only servers,
         where ``tools/list`` raises -32601); True without capability info (legacy fallback).
@@ -574,10 +576,12 @@ class MCPServerTransportMixin:
 
     def _streamable_http_transport(self, url: str, headers: dict, connect_timeout: float,
                                    ssl_verify, client_cert, oauth_auth,
-                                   strict_cfg_headers: bool, configured_header_names: set):
+                                   strict_cfg_headers: bool, configured_header_names: set, *, follow_redirects=True):
         """Streamable HTTP context manager: mcp >= 1.24.0 gets a caller-owned httpx client; on the
         deprecated API (mcp < 1.24.0) the SDK owns the client."""
         if not _core._MCP_NEW_HTTP:
+            if not follow_redirects:
+                raise ImportError("Scoped MCP requires a caller-owned HTTP client to disable redirects")
             if strict_cfg_headers:  # fail closed: without an owned client redirects can't be hooked
                 raise ImportError(f"MCP server '{self.name}' requires mcp >= 1.24.0 to "
                                   "enforce the portable redirect-header boundary "
@@ -592,7 +596,7 @@ class MCPServerTransportMixin:
         # verify/cert live on the inner transport: a custom transport= makes client-level TLS kwargs
         # inert — and suppresses httpx's own proxy auto-detection, hence the explicit mounts=.
         inner_transport = httpx.AsyncHTTPTransport(verify=ssl_verify, **_present(cert=client_cert))
-        client_kwargs: dict = {"follow_redirects": True, "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
+        client_kwargs: dict = {"follow_redirects": follow_redirects, "timeout": httpx.Timeout(float(connect_timeout), read=300.0),
                                **({"headers": headers} if headers else {}),
                                "event_hooks": {"response": [_make_http_rejection_recorder(self._http_rejection)]},
                                "transport": _make_mcp_body_cap_transport(httpx, inner_transport),
@@ -610,8 +614,8 @@ class MCPServerTransportMixin:
                     yield streams
         return _owned_client_streams()
 
-    async def _run_http(self, config: dict):
-        """Run the server using HTTP/StreamableHTTP (or SSE) transport."""
+    def _http_transport_options(self, config: dict):
+        """Resolve the canonical connector's TLS, headers and auth for a new HTTP session."""
         if not _core._ensure_mcp_sdk():
             raise _sdk_unavailable_error(self.name)
         if not _core._MCP_HTTP_AVAILABLE:
@@ -627,7 +631,6 @@ class MCPServerTransportMixin:
         # publish another endpoint's identity alongside this session.
         self._resolved_identity = _registration._identity_digest(inputs)
         url, headers = inputs
-        logger.debug("MCP server '%s': connecting to %s", self.name, url)
         self._http_rejection = {}  # last 4xx/5xx the owned client saw this attempt (recorder hook)
         # Seed MCP-Protocol-Version (user override wins) from the HANDSHAKE version, not the latest: a
         # 2026-07-28 header routes the handshake-era ``initialize()`` onto the envelope ladder, which rejects it.
@@ -636,6 +639,13 @@ class MCPServerTransportMixin:
         connect_timeout = config.get("connect_timeout", _core._DEFAULT_CONNECT_TIMEOUT)
         common = (url, headers, connect_timeout, config.get("ssl_verify", True), _resolve_client_cert(self.name, config),
                   self._build_oauth_auth(url, config), bool(config.get("strict_redirect_headers")))
+        return common, configured_header_names
+
+    async def _run_http(self, config: dict):
+        """Run the server using HTTP/StreamableHTTP (or SSE) transport."""
+        common, configured_header_names = self._http_transport_options(config)
+        url, _, connect_timeout, *_ = common
+        logger.debug("MCP server '%s': connecting to %s", self.name, url)
         if config.get("transport") == "sse":
             return await self._serve_transport(self._sse_transport(*common), "SSE", float(connect_timeout))
         if self._sse_fallback:

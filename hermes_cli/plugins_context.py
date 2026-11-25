@@ -40,6 +40,8 @@ class PluginContext(PluginCapabilityCtxMixin, PluginIdleTaskCtxMixin):
 
     def __init__(self, manifest: PluginManifest, manager: PluginManager):
         self.manifest = manifest
+        self._mcp_scope_declaration = tuple(manifest.mcp_scopes.items())
+        self._mcp_scope_plugin = self.plugin_id if self._mcp_scope_declaration else ""
         self._manager = manager
         self._llm: Any = None  # lazy; tests preseed it (see ``llm``)
         # Set when this context's load overran ``plugins.load_timeout_seconds``: the abandoned worker may
@@ -348,6 +350,28 @@ class PluginContext(PluginCapabilityCtxMixin, PluginIdleTaskCtxMixin):
         _facade().logger.debug("Plugin %s called MCP %s/%s (timeout=%ss, %d chars returned)",
                                self.manifest.name, server, tool, timeout, len(raw or ""))
         return self._mcp_envelope(raw)
+
+    def call_mcp_scoped(
+        self, server: str, tool: str, arguments: Optional[dict[str, Any]] = None, *, timeout: float = 30,
+    ) -> dict[str, Any]:
+        """Call one exact remote tool in a fresh, callback-disabled native MCP HTTP session.
+
+        The enabled plugin's ``mcp_scoped_allowlist`` must match its ``mcp_scopes`` declaration
+        for this connector. The host adds a ``scope`` receipt; it is not part of the remote result.
+        Missing grants raise PermissionError. Only the existing profile connector is used.
+        """
+        # No caller-provided policy, registry alias, endpoint, credential or stdio command.
+        declared = dict(self._mcp_scope_declaration).get(server) if type(server) is str else None
+        if not declared or type(tool) is not str or tool not in declared:
+            raise PermissionError("MCP tool is not in the plugin's declared scope")
+        from tools.mcp_scoped import call_scoped
+
+        raw, receipt = call_scoped(self._manager.scope_key, self._mcp_scope_plugin, server, tool,
+                                   dict(arguments or {}), declared, timeout, abandoned=lambda: self._load_abandoned)
+        envelope = self._mcp_envelope(raw)
+        if envelope["ok"] and not envelope.get("truncated"):
+            envelope["scope"] = receipt
+        return envelope
 
     _MCP_RESULT_CHAR_CAP = 65536
 

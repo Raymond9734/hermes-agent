@@ -540,12 +540,12 @@ class HermesTokenStorage:
             return True
         return False
 
-    async def get_client_info(self) -> "OAuthClientInformationFull | None":
+    async def get_client_info(self, *, persist_normalization: bool = True) -> "OAuthClientInformationFull | None":
         coerced: list[bool] = []
         info = self._load_model(
             self._client_info_path(), "OAuthClientInformationFull", "client info",
             lambda data: coerced.append(self._coerce_secret_auth_method(data)))
-        if info is not None and coerced[0]:
+        if persist_normalization and info is not None and coerced[0]:
             _write_json(self._client_info_path(), _model_json(info))  # persist so later flows skip the coercion
         return info
 

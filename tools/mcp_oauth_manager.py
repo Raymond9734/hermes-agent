@@ -15,10 +15,12 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlsplit
 
 from tools.mcp_oauth_provider import HermesProviderMixin
 
 logger = logging.getLogger(__name__)
+
 
 try:
     from mcp.client.auth.oauth2 import OAuthClientProvider as _SDKOAuthClientProvider
@@ -308,6 +310,69 @@ class HermesMCPOAuthProvider(HermesProviderMixin, *_SDK_BASES):
 _HERMES_PROVIDER_CLS: Optional[type] = HermesMCPOAuthProvider if _SDK_BASES else None
 
 
+class _ExistingGrantAuth(HermesMCPOAuthProvider):
+    """Use the canonical saved grant without entering the SDK's interactive/discovery flow."""
+
+    def __init__(self, *, configured_client: tuple, **kwargs):
+        super().__init__(preregistered=bool(configured_client[0]), **kwargs)
+        self._configured_client = configured_client
+
+    @staticmethod
+    def _valid_endpoint(url: str) -> bool:
+        parsed = urlsplit(url)
+        return bool(parsed.hostname and not (parsed.fragment or parsed.username is not None)
+                    and (parsed.scheme == "https" or (parsed.scheme == "http"
+                         and parsed.hostname in {"127.0.0.1", "::1", "localhost"})))
+
+    async def _load_existing_grant(self):
+        from tools.mcp_oauth import OAuthNonInteractiveError
+
+        storage = self.context.storage
+        info = await storage.get_client_info(persist_normalization=False)
+        if self._hermes_preregistered and (info is None or
+                (info.client_id, info.client_secret or None) != self._configured_client):
+            raise OAuthNonInteractiveError("Scoped MCP requires the configured client's existing authorization")
+        self.context.client_info = info
+        self.context.current_tokens = await storage.get_tokens()
+        if self.context.current_tokens is None:
+            raise OAuthNonInteractiveError("Scoped MCP requires an existing OAuth authorization")
+
+    async def async_auth_flow(self, request):  # type: ignore[override]
+        from mcp.shared.inbound import MCP_PROTOCOL_VERSION_HEADER
+        from tools.mcp_oauth import OAuthNonInteractiveError
+
+        unavailable = "Scoped MCP requires an existing OAuth authorization"
+        async with self.context.lock:
+            storage = self.context.storage
+            self.context.protocol_version = request.headers.get(MCP_PROTOCOL_VERSION_HEADER)
+            await self._load_existing_grant()
+            if not self._hermes_live_ttl():
+                await self._hermes_acquire_refresh_fence()
+                try:
+                    # A peer may have updated the canonical grant while we waited for the fence.
+                    await self._load_existing_grant()
+                    if not self._hermes_live_ttl():
+                        meta = storage.load_oauth_metadata()
+                        issuer = str(meta.issuer).rstrip("/") if meta is not None and meta.issuer else ""
+                        endpoint = str(meta.token_endpoint) if meta is not None and meta.token_endpoint else ""
+                        if (not self.context.can_refresh_token() or not issuer
+                                or issuer != (storage.loaded_issuer or "").rstrip("/")
+                                or not self._valid_endpoint(issuer) or not self._valid_endpoint(endpoint)):
+                            raise OAuthNonInteractiveError(unavailable)
+                        self.context.oauth_metadata = meta
+                        refresh = await self._hermes_build_refresh_request()
+                        response = yield refresh
+                        if not (200 <= response.status_code < 300) or not await self._handle_refresh_response(response):
+                            raise OAuthNonInteractiveError(unavailable)
+                finally:
+                    await self._hermes_release_refresh_fence()
+            if not self._hermes_live_ttl() or not self.context.current_tokens.access_token:
+                raise OAuthNonInteractiveError(unavailable)
+            self._add_auth_header(request)
+        # Never consume the resource response through the SDK's challenge/replay state machine.
+        yield request
+
+
 class MCPOAuthManager:
     """Single source of truth for per-server MCP OAuth state. ``_entries`` is guarded by
     ``_entries_lock`` (get-or-create); per-entry state by the entry's ``asyncio.Lock``."""
@@ -334,6 +399,20 @@ class MCPOAuthManager:
                 if entry.provider is not None:
                     entry.provider._hermes_home = key[0]
             return entry.provider
+
+    def get_existing_grant_auth(self, server_name: str, server_url: str, oauth_config: Optional[dict]) -> Optional[Any]:
+        """Reference this profile's original storage, without initializing or replacing the ordinary provider."""
+        from tools.mcp_oauth import _build_client_metadata
+        from tools.mcp_oauth_provider import prepare_oauth_config
+
+        if _HERMES_PROVIDER_CLS is None or not _ExistingGrantAuth._valid_endpoint(server_url):
+            return None
+        cfg, storage = prepare_oauth_config(server_name, server_url, oauth_config)
+        # No callback port reservation, registration persistence, or OAuth handlers.
+        return _ExistingGrantAuth(server_name=server_name, server_url=server_url, storage=storage,
+                                  configured_client=(cfg.get("client_id"), cfg.get("client_secret") or None),
+                                  client_metadata=_build_client_metadata({**cfg, "_resolved_port": 0}),
+                                  token_user_agent=cfg.get("user_agent"))
 
     @staticmethod
     def _key(server_name: str, hermes_home: str | Path | None = None) -> tuple[str, str]:

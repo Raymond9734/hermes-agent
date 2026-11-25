@@ -35,8 +35,25 @@ _KNOWN_MANIFEST_FIELDS: set[str] = {
     "pip_dependencies", "provides_browser_providers", "provides_web_providers",
     "manifest_version", "api_version", "requires_plugins", "python_dependencies", "config_schema",
     "license", "homepage", "tags", "capabilities", "emits", "listens", "hermes", "depends",
-    "requires_hermes", "python_runtime", "provides_locales", "requires_auth", "oauth", "config_keys",
+    "requires_hermes", "python_runtime", "provides_locales", "requires_auth", "oauth", "config_keys", "mcp_scopes",
 }
+
+
+def parse_mcp_scopes(raw: object) -> dict[str, frozenset[str]]:
+    """Exact remote names, never normalized. A malformed declaration/grant is no grant."""
+    if not isinstance(raw, dict):
+        return {}
+
+    def valid_name(value):
+        return isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,128}", value) is not None
+
+    scopes = {}
+    for server, names in raw.items():
+        if (not valid_name(server) or not isinstance(names, list) or not names
+                or not all(valid_name(name) for name in names) or len(set(names)) != len(names)):
+            return {}
+        scopes[server] = frozenset(names)
+    return scopes
 
 # Highest manifest schema version this Hermes understands.
 SUPPORTED_MANIFEST_VERSION = 2
@@ -417,6 +434,7 @@ class PluginManifest:
     # Dotted paths in Hermes' own config sections the plugin reads (``memory.retaindb``), so
     # ``hermes config get/set`` recognizes them while the plugin is active (hermes_cli/config_runtime_keys.py).
     config_keys: list[str] = field(default_factory=list)
+    mcp_scopes: dict[str, frozenset[str]] = field(default_factory=dict)
 
 
 def parse_provides_locales(raw: Any, key: str = "") -> tuple[list[str], dict[str, dict[str, Any]]]:
@@ -580,6 +598,7 @@ def parse_manifest_file(
             **_parse_manifest_v2_fields(data, key), emits=data.get("emits") or [],
             listens=data.get("listens") or [],
             provides_locales=provides_locales, locale_metadata=locale_metadata,
+            mcp_scopes=parse_mcp_scopes(data.get("mcp_scopes")),
         )
     except Exception as exc:
         logger.warning("Failed to parse %s: %s", manifest_file, exc, exc_info=_plugins_debug())

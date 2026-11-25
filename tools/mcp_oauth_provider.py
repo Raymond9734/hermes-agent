@@ -326,11 +326,15 @@ class HermesProviderMixin:
                     # refresh token would only burn a generation on a single-use
                     # provider. Skip the POST and let the flow restart.
                     raise _RefreshCompletedByPeer
-            return self._prepare_token_request(await super()._refresh_token())
+            return await self._hermes_build_refresh_request()
         except BaseException:
             # Never hold the fence when no POST will follow.
             await self._hermes_release_refresh_fence()
             raise
+
+    async def _hermes_build_refresh_request(self):
+        """Use the SDK's refresh request and the native token user-agent."""
+        return self._prepare_token_request(await super()._refresh_token())
 
     def _hermes_live_ttl(self) -> bool:
         """True when the installed token is not known to be past due.
