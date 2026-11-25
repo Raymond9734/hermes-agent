@@ -59,6 +59,18 @@ def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
     assert json.loads(external.kanban_json)['worker_runner'] == {
         'plugin': 'worker-guard', 'provider': 'custom', 'model': 'loop-model', 'effort': 'high',
     }
+    with closing(connect(board='owned')) as conn:
+        conn.execute('UPDATE tasks SET worker_runner=? WHERE id=?', ('different-plugin', task.id))
+        conn.commit()
+    with pytest.raises(AuthorityRefusal, match='required_worker_plugin_unavailable'):
+        build_kanban_policy(connection, params, config)
+    corrupt = tmp_path / 'corrupt.sqlite'
+    corrupt.write_bytes(b'not sqlite')
+    with pytest.raises(AuthorityRefusal, match='^storage_unavailable$'):
+        build_kanban_policy(connection, params | {'db': str(corrupt)}, config)
+    with closing(connect(board='owned')) as conn:
+        conn.execute('UPDATE tasks SET worker_runner=? WHERE id=?', ('worker-guard', task.id))
+        conn.commit()
     for changed in ({'run_id': task.current_run_id + 1}, {'board': 'foreign'}, {'claim_lock': 'forged'}, {'cwd': '/tmp'},
                     {'required_worker_plugin': None}, {'worker_runner': 'arbitrary'}):
         with pytest.raises(AuthorityRefusal):

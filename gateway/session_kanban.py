@@ -19,7 +19,7 @@ def _runner_pins(task, required, runner):
     pins = dict(plugin=runner, provider=task.provider_override, model=task.model_override, effort=task.reasoning_effort)
     if (runner != required or task.goal_mode or any(not isinstance(value, str)
             or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}', value) for value in pins.values())):
-        raise ValueError('required_worker_plugin_unavailable')
+        raise AuthorityRefusal('required_worker_plugin_unavailable')
     return pins
 
 
@@ -59,7 +59,11 @@ def build_kanban_policy(connection, params, config):
             if kb._retry_status_for_run(conn, task.id, task.current_run_id) == 'review':
                 # Same rule as the dispatcher's review lane: the reviewer always loads sdlc-review.
                 skills = list(dict.fromkeys([*skills, 'sdlc-review']))
-    except (ValueError, OSError, sqlite3.Error) as exc:
+    except AuthorityRefusal:
+        raise
+    except sqlite3.Error as exc:
+        raise AuthorityRefusal('storage_unavailable', field='kanban_claim') from exc
+    except (ValueError, OSError) as exc:
         raise AuthorityRefusal('invalid_kanban_claim') from exc
     cwd = task.workspace_path
     private = {}
