@@ -415,7 +415,39 @@ def execute(frame, channel):
         raise RuntimeError('stale_epoch')
     store = RuntimeSessionStore(rpc, scope, outbox_dir(frame['home'], scope['execution_id']), adopted)
     from gateway.session_kanban import bind_worker_context
-    bind_worker_context(frame)
+    runner = bind_worker_context(frame)
+    kanban = json.loads(frame['policy'].get('kanban_json') or '{}')
+    if kanban.get('worker_runner') is not None:
+        from gateway.session_kanban import run_external_worker
+        from gateway.session_managed_worker import worker_turn_scope
+        controls = WorkerControls(channel, frame['route'])
+        interval = activity_frame_interval(frame)
+        last = time.monotonic()
+
+        def activity():
+            # Only a runner returning to its live fence can keep the owner clock fresh.
+            nonlocal last
+            now = time.monotonic()
+            if interval is not None and now - last >= interval:
+                channel.send(ACTIVITY_FRAME['type'])
+                last = now
+
+        try:
+            channel.send('ready', pid=os.getpid())
+            with worker_turn_scope(frame):
+                result = run_external_worker(frame, runner, controls.stopped, activity)
+            channel.send('result', result=result_frame(result))
+            if not controls.finish.wait(30):
+                raise ValueError('managed_finish_timeout')
+            store.finish()
+            channel.send('finished')
+        finally:
+            try:
+                store.close()
+            finally:
+                with contextlib.suppress(Exception):
+                    rpc.close()
+        return  # Never initialize an agent, its provider, or profile MCP for a pinned runner.
     # Background processes a previous admission of this session started outlive that worker
     # (F24); adopt them so process_manage in this turn can poll and kill them.
     from tools.process_registry import process_registry

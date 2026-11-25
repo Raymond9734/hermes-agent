@@ -20,9 +20,10 @@ TOOL_REQUEST_MIDDLEWARE = "tool_request"
 TOOL_EXECUTION_MIDDLEWARE = "tool_execution"
 LLM_REQUEST_MIDDLEWARE = "llm_request"
 LLM_EXECUTION_MIDDLEWARE = "llm_execution"
+KANBAN_RUNNER = "kanban_runner"
 
 VALID_MIDDLEWARE: set[str] = {
-    TOOL_REQUEST_MIDDLEWARE, TOOL_EXECUTION_MIDDLEWARE, LLM_REQUEST_MIDDLEWARE, LLM_EXECUTION_MIDDLEWARE,
+    TOOL_REQUEST_MIDDLEWARE, TOOL_EXECUTION_MIDDLEWARE, LLM_REQUEST_MIDDLEWARE, LLM_EXECUTION_MIDDLEWARE, KANBAN_RUNNER,
 }
 
 # Bound only in the private, single-turn Kanban worker process (like its frozen config).
@@ -30,7 +31,7 @@ VALID_MIDDLEWARE: set[str] = {
 _worker_guards: dict[str, Callable] = {}
 
 
-def bind_required_worker_plugin(plugin: str) -> None:
+def bind_required_worker_plugin(plugin: str, *, external=False) -> Callable | None:
     """Require a successfully loaded owner of both execution guards before agent startup."""
     from hermes_cli.plugins import _delivery_manager
 
@@ -41,14 +42,16 @@ def bind_required_worker_plugin(plugin: str) -> None:
             raise ValueError('required_worker_plugin_unavailable')
         handles = manager._ownership_ledger.get(plugin, ())
         guards = {}
-        for kind in (LLM_EXECUTION_MIDDLEWARE, TOOL_EXECUTION_MIDDLEWARE):
+        for kind in (LLM_EXECUTION_MIDDLEWARE, TOOL_EXECUTION_MIDDLEWARE, *((KANBAN_RUNNER,) if external else ())):
             registered = manager._middleware.get(kind, ())
             owned = [h.callback for h in handles if h.active and h.kind == 'middleware'
                      and h.key == kind and any(h.callback is callback for callback in registered)]
             if len(owned) != 1 or not callable(owned[0]):
                 raise ValueError('required_worker_plugin_unavailable')
             guards[kind] = owned[0]
+        runner = guards.pop(KANBAN_RUNNER, None)
         _worker_guards.update(guards)
+        return runner
 
 
 @dataclass

@@ -5,10 +5,22 @@ from contextlib import closing
 from dataclasses import asdict, replace
 import threading
 import json
+import re
 from pathlib import Path
 import sqlite3
+from typing import Any
 
 from persistence.core.errors import AuthorityRefusal
+
+
+def _runner_pins(task, required, runner):
+    if runner is None:
+        return None
+    pins = dict(plugin=runner, provider=task.provider_override, model=task.model_override, effort=task.reasoning_effort)
+    if (runner != required or task.goal_mode or any(not isinstance(value, str)
+            or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9_.:/-]{0,127}', value) for value in pins.values())):
+        raise ValueError('required_worker_plugin_unavailable')
+    return pins
 
 
 def build_kanban_policy(connection, params, config):
@@ -41,7 +53,8 @@ def build_kanban_policy(connection, params, config):
             if bound and json.loads(bound[0])['request_id'] != 'kanban:' + json.dumps([board, task.id, task.current_run_id], separators=(',', ':')):
                 raise AuthorityRefusal('stale_kanban_claim')
             context = kb.build_worker_context(conn, task.id)
-            required_plugin = conn.execute('SELECT required_worker_plugin FROM tasks WHERE id=?', (task.id,)).fetchone()[0]
+            required_plugin, runner_id = conn.execute('SELECT required_worker_plugin,worker_runner FROM tasks WHERE id=?', (task.id,)).fetchone()
+            runner = _runner_pins(task, required_plugin, runner_id)
             skills = list(task.skills or ())
             if kb._retry_status_for_run(conn, task.id, task.current_run_id) == 'review':
                 # Same rule as the dispatcher's review lane: the reviewer always loads sdlc-review.
@@ -51,7 +64,7 @@ def build_kanban_policy(connection, params, config):
     cwd = task.workspace_path
     private = {}
     policy = kanban_launch_policy(task, cwd, config, private)
-    context = dict(params, workspace=cwd, branch=task.branch_name, tenant=task.tenant,
+    context: dict[str, Any] = dict(params, workspace=cwd, branch=task.branch_name, tenant=task.tenant,
         profile=task.assignee, workspaces_root=str(kb.workspaces_root(board=board).resolve()),
         skills=skills, goal_mode=task.goal_mode, goal_max_turns=task.goal_max_turns,
         goal_text='\n\n'.join(p for p in (task.title, task.body) if p), context=context,
@@ -59,6 +72,9 @@ def build_kanban_policy(connection, params, config):
     context['db'] = str(path)
     if required_plugin is not None:
         context['required_worker_plugin'] = required_plugin
+    if runner is not None:
+        context['worker_runner'] = runner
+        private.clear()  # The plugin runner has no reason to bind native route credentials.
     request = json.loads(policy.request_json)
     request.update(source='kanban', board=board, task_id=task.id, run_id=task.current_run_id)
     return replace(policy, source='kanban', platform='cli', toolsets=tuple(sorted(set(policy.toolsets) | {'kanban'})),
@@ -199,7 +215,7 @@ def bind_worker_context(frame):
             if (task is None or task.status != 'running' or task.current_run_id != context['run_id']
                     or task.claim_lock != context['claim_lock']):
                 raise AuthorityRefusal('stale_kanban_claim')
-            required = conn.execute('SELECT required_worker_plugin FROM tasks WHERE id=?', (task.id,)).fetchone()[0]
+            required, runner = conn.execute('SELECT required_worker_plugin,worker_runner FROM tasks WHERE id=?', (task.id,)).fetchone()
             # The dispatcher's spawned worker stays the run's pid (reclaim, timeout and operator
             # kills target it; ``_watch_submitter`` ties this interpreter's life to it). The bound
             # interpreter is recorded beside it so a sweep can tell when the attempt is truly gone.
@@ -214,10 +230,16 @@ def bind_worker_context(frame):
     expires = json.loads(claimed[0]).get('expires') if claimed else None
     if isinstance(expires, int) and claimed[1]:
         env['HERMES_KANBAN_CLAIM_TTL_SECONDS'] = str(max(1, expires - int(claimed[1])))
-    _watch_submitter(Path(context['db']), context['run_id'])
+    _watch_submitter(Path(context['db']), context['run_id'], external=runner is not None)
     os.environ.update(env)
     os.chdir(context['workspace'])
-    _enforce_worker_plugin(context, required)
+    try:
+        if context.get('worker_runner') != _runner_pins(task, required, runner):
+            raise ValueError('required_worker_plugin_unavailable')
+    except ValueError:
+        _record_worker_result(context, 1, 'required_worker_plugin_unavailable')
+        raise
+    return _enforce_worker_plugin(context, required)
 
 
 def _enforce_worker_plugin(context, required):
@@ -227,6 +249,8 @@ def _enforce_worker_plugin(context, required):
             raise ValueError('required_worker_plugin_unavailable')
         if required is not None:
             from hermes_cli.middleware import bind_required_worker_plugin
+            if context.get('worker_runner') is not None:
+                return bind_required_worker_plugin(required, external=True)
             bind_required_worker_plugin(required)
     except ValueError:
         _record_worker_result(context, 1, 'required_worker_plugin_unavailable')
@@ -236,7 +260,7 @@ def _enforce_worker_plugin(context, required):
 _TURNS_DONE = threading.Event()
 
 
-def _watch_submitter(db, run_id):
+def _watch_submitter(db, run_id, *, external=False):
     """The dispatcher's spawned worker is this attempt's handle: killing it (an operator, a
     timeout, an OOM kill) must end the attempt, as it did when the worker ran the agent itself.
     Exiting hard leaves no ``worker_result``, so the dead-worker sweep books this run's crash.
@@ -252,8 +276,44 @@ def _watch_submitter(db, run_id):
                 except sqlite3.Error:
                     continue
                 if row and row[0] and row[0] != os.getpid() and not _worker_alive(row[0], row[1]):
+                    if external and os.name != 'nt' and os.getpgrp() == os.getpid():
+                        import signal
+                        os.killpg(os.getpid(), signal.SIGKILL)  # the guarded runner's children share this group
                     os._exit(1)
     threading.Thread(target=watch, name='kanban-submitter-watch', daemon=True).start()
+
+
+class KanbanRunnerStopped(RuntimeError):
+    """The runner lost the owner stop/claim fence; no further action is allowed."""
+
+
+def run_external_worker(frame, runner, stopped, activity):
+    """Only a callback bound by bind_worker_context can execute, never a command from a card."""
+    context = json.loads(frame['policy']['kanban_json'])
+    pins = context['worker_runner']
+    code, reason = 1, 'required_worker_plugin_unavailable'
+
+    def check():
+        if stopped.is_set() or not _bound_claim_is_live(context):
+            raise KanbanRunnerStopped('kanban_runner_stopped')
+        activity()
+
+    try:
+        check()
+        if not callable(runner) or frame.get('attachments_v1') or frame['api_key'] is not None:
+            raise ValueError(reason)
+        outcome = runner(pins=dict(pins), session_id=frame['scope']['session_id'], check=check)
+        if (not isinstance(outcome, tuple) or len(outcome) != 2 or type(outcome[0]) is not int
+                or outcome[0] not in (0, 1, 75, 78) or not isinstance(outcome[1], str)
+                or not re.fullmatch(r'[a-z][a-z0-9_]{0,100}', outcome[1])):
+            raise ValueError('invalid_kanban_runner_result')
+        code, reason = outcome
+    except KanbanRunnerStopped:
+        reason = 'kanban_runner_stopped'
+    finally:
+        _record_worker_result(context, code, reason)
+    return dict(final_response=reason, failed=code != 0, interrupted=reason == 'kanban_runner_stopped',
+                provider=pins['provider'], model=pins['model'])
 
 
 def run_worker_turns(agent, frame, history):

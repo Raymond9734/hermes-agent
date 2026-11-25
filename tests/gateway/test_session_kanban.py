@@ -27,7 +27,7 @@ def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
     with closing(connect(board='owned')) as conn:
         task_id = kb.create_task(conn, title='Owned acceptance', body='Goal criteria', assignee='default',
             workspace_kind='dir', workspace_path=str(workspace), skills=['owned-skill'], goal_mode=True,
-            goal_max_turns=3, model_override='loop-model', provider_override='custom')
+            goal_max_turns=3, model_override='loop-model', provider_override='custom', reasoning_effort='high')
         kb.recompute_ready(conn)
         task = kb.claim_task(conn, task_id)
     assert task is not None and task.current_run_id is not None
@@ -52,8 +52,15 @@ def test_claim_freezes_task_policy_and_rejects_forgery(tmp_path, monkeypatch):
         conn.commit()
     pinned, _ = build_kanban_policy(connection, params, config)
     assert json.loads(pinned.kanban_json)['required_worker_plugin'] == 'worker-guard'
+    with closing(connect(board='owned')) as conn:
+        conn.execute('UPDATE tasks SET worker_runner=?, goal_mode=0 WHERE id=?', ('worker-guard', task.id))
+        conn.commit()
+    external, _ = build_kanban_policy(connection, params, config)
+    assert json.loads(external.kanban_json)['worker_runner'] == {
+        'plugin': 'worker-guard', 'provider': 'custom', 'model': 'loop-model', 'effort': 'high',
+    }
     for changed in ({'run_id': task.current_run_id + 1}, {'board': 'foreign'}, {'claim_lock': 'forged'}, {'cwd': '/tmp'},
-                    {'required_worker_plugin': None}):
+                    {'required_worker_plugin': None}, {'worker_runner': 'arbitrary'}):
         with pytest.raises(AuthorityRefusal):
             build_kanban_policy(connection, params | changed, config)
     connection.native_owner = False
@@ -86,6 +93,30 @@ def test_real_dispatcher_lifecycle(tmp_path, mode):
     assert receipt['admissions'] == 1 and receipt['retry_same_session']
     assert receipt['goal_continuation'] and receipt['stable_prefix']
     print(json.dumps(receipt))
+
+
+def test_runner_bootstrap_never_reads_native_credentials(tmp_path, monkeypatch):
+    from dataclasses import replace
+    from gateway.session_managed_worker import _bootstrap
+    from gateway.session_policy import build_policy
+
+    def never(*args, **kwargs):
+        pytest.fail('external runner reached native model setup')
+
+    for name in ('gateway.session_policy.route_launch_key',
+                 'gateway.session_policy_credentials.recover_config_secrets',
+                 'gateway.session_worker_construct.construct_inputs'):
+        monkeypatch.setattr(name, never)
+    policy = build_policy({'cwd': str(tmp_path), 'model': 'fixture', 'provider': 'runner-provider'},
+                          {'plugins': {'enabled': ['fixture']}})
+    pins = {'plugin': 'fixture', 'provider': 'runner-provider', 'model': 'fixture', 'effort': 'high'}
+    policy = replace(policy, kanban_json=json.dumps({'worker_runner': pins}), config_secret_ref='not-read')
+    live = SimpleNamespace(route='fixture', source=SimpleNamespace(user_id='user', chat_id='chat'))
+    owner = SimpleNamespace(sessions={'sid': live}, runner=None, profile_id=str(tmp_path))
+    frame = _bootstrap(owner, SimpleNamespace(session_id='sid'), {'payload': {'text': 'fixture'}}, policy, {})
+    assert frame['api_key'] is None and frame['policy']['config_secret_ref'] is None
+    assert json.loads(frame['policy']['kanban_json'])['worker_runner'] == pins
+    assert json.loads(frame['policy']['config_json'])['plugins']['enabled'] == ['fixture']
 
 
 def test_late_launcher_cannot_stamp_replacement_claim(tmp_path, monkeypatch):

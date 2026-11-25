@@ -64,8 +64,9 @@ def _bootstrap(authority, ref, row, policy, scope, text=None):
     from gateway.session_ingress import row_turn_author
     from gateway.session_policy import route_launch_key
     from gateway.session_policy_credentials import recover_config_secrets
+    external = json.loads(policy.kanban_json or '{}').get('worker_runner') is not None
     terminal = json.loads(policy.terminal_json)
-    if policy.config_secret_ref:
+    if policy.config_secret_ref and not external:
         for path, value in recover_config_secrets(authority, policy).items():
             if path[0] is None:
                 terminal[path[1]] = value
@@ -78,16 +79,17 @@ def _bootstrap(authority, ref, row, policy, scope, text=None):
         'yolo': _session_yolo(authority, live.route, policy),
         **({'surface_v1': row['payload']['surface_v1']} if row['payload'].get('surface_v1') else {}),
         **({'display_v1': row['payload']['display_v1']} if row['payload'].get('display_v1') else {})})
-    from gateway.session_worker_construct import construct_inputs
-    request['construct_v1'] = construct_inputs(authority, policy, live.source.chat_id, live.source)
+    if not external:
+        from gateway.session_worker_construct import construct_inputs
+        request['construct_v1'] = construct_inputs(authority, policy, live.source.chat_id, live.source)
     # This owner consumes the worker's ACTIVITY_FRAME, often enough for its wedge timeout.
     from gateway.run import _float_env
     request['activity_frames_v1'] = {'interval': activity_interval(_float_env("HERMES_AGENT_TIMEOUT", 1800))}
-    config = _worker_config(authority, policy)
+    config = policy.config(secrets=False) if external else _worker_config(authority, policy)
     hydrated = replace(policy, config_json=json.dumps(config), request_json=json.dumps(request),
                        terminal_json=json.dumps(terminal), credential_ref=None, config_secret_ref=None)
     return {'version': 1, 'home': authority.profile_id, 'scope': scope,
-            'policy': asdict(hydrated), 'api_key': route_launch_key(authority, policy, config),
+            'policy': asdict(hydrated), 'api_key': None if external else route_launch_key(authority, policy, config),
             'text': row['payload']['text'] if text is None else text, 'route': live.route,
             **({'attachments_v1': row['payload']['attachments_v1']} if 'attachments_v1' in row['payload'] else {}),
             'user_id': live.source.user_id, 'chat_id': live.source.chat_id,
@@ -336,9 +338,15 @@ class ManagedWorker:
                 pass
         (self.process.kill if kill else self.process.terminate)()
 
-    def close(self):
+    def close(self, *, external=False):
         self.closed.set()
         self._demand.release()  # a reader parked between frames exits; one mid-read ends at EOF
+        if external and os.name != 'nt' and self.process.returncode is None:
+            # Don't poll (and reap) first: an unexpected interpreter death can leave the
+            # runner in our private spawn group. Until reaped the leader PID cannot recycle.
+            import signal
+            with suppress(ProcessLookupError, PermissionError):
+                os.killpg(self.process.pid, signal.SIGKILL)
         if self.process.poll() is None:
             self._signal_worker(kill=False)
             self._signal_group(kill=False)
@@ -704,6 +712,7 @@ async def execute_managed(authority, ref, row, policy):
     if spawned is None:
         return ''
     worker, process = spawned
+    external = json.loads(policy.kanban_json or '{}').get('worker_runner') is not None
     workers = authority._managed_workers
     # A Stop acknowledged during the env/spawn awaits found no worker and was latched for this
     # generation; consume it in the same step that makes the worker reachable to interrupt_managed.
@@ -757,8 +766,9 @@ async def execute_managed(authority, ref, row, policy):
             if frame == {'type': 'finished'} and accepted is not None:
                 # 'finished' follows the worker's durable execution.finish: the turn is complete.
                 # A slow or non-zero interpreter exit after it is close()'s cleanup, not a loss.
-                with suppress(subprocess.TimeoutExpired):
-                    await asyncio.to_thread(process.wait, 10)
+                if not external:
+                    with suppress(subprocess.TimeoutExpired):
+                        await asyncio.to_thread(process.wait, 10)
                 accepted = _with_stop_cause(accepted, worker)
                 await _finalize_managed_refusal(authority, scope['session_id'], accepted)
                 # Like in-process execution, settlement belongs to the drain's stream lock.
@@ -796,4 +806,4 @@ async def execute_managed(authority, ref, row, policy):
         raise ManagedExecutionUnknown('managed_worker_unknown') from exc
     finally:
         workers.pop(ref.session_id, None)
-        await asyncio.to_thread(worker.close)
+        await asyncio.to_thread(worker.close, **({'external': True} if external else {}))

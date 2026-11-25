@@ -878,6 +878,7 @@ _LATER_TASK_COLUMNS = (
     ("reasoning_effort", "reasoning_effort TEXT"),
     # Trusted board integrations can require an execution guard for a card.
     ("required_worker_plugin", "required_worker_plugin TEXT"),
+    ("worker_runner", "worker_runner TEXT"),  # trusted board integration only; no card API setter
     # Ralph-style goal loop toggle; 0 = classic single-shot worker.
     ("goal_mode", "goal_mode INTEGER NOT NULL DEFAULT 0"),
     ("goal_max_turns", "goal_max_turns INTEGER"),
