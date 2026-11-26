@@ -1250,9 +1250,15 @@ def resolve_runtime_provider(*, requested: Optional[str] = None, explicit_api_ke
         if not ((requested and requested.strip()) or model_cfg.get("provider")):
             raise SharedProviderAuthError("A shared OAuth grant requires an explicit provider.",
                                           provider=requested_provider, code="shared_provider_explicit_required")
+        # The current model's URL and wire mode belong to its provider, not to a
+        # different provider the user is switching to. Unqualified settings and
+        # settings for Codex itself still have to satisfy the exact route fence.
+        configured_provider = _cfg_provider(model_cfg)
+        owns_route = configured_provider in {"", "auto"} or _same_registered_provider(requested_provider, configured_provider)
+        codex_route_cfg = model_cfg if owns_route else {}
         if (explicit_api_key or (explicit_base_url or "").rstrip("/") not in {"", DEFAULT_CODEX_BASE_URL}
-                or str(model_cfg.get("base_url") or "").rstrip("/") not in {"", DEFAULT_CODEX_BASE_URL}
-                or model_cfg.get("api_mode") not in (None, "", "codex_responses")
+                or str(codex_route_cfg.get("base_url") or "").rstrip("/") not in {"", DEFAULT_CODEX_BASE_URL}
+                or codex_route_cfg.get("api_mode") not in (None, "", "codex_responses")
                 or _maybe_apply_codex_app_server_runtime(provider=requested_provider, api_mode="codex_responses",
                     model_cfg=model_cfg, requested_provider=requested_provider) != "codex_responses"):
             raise SharedProviderAuthError("A shared OAuth grant requires its native provider endpoint and transport.",
