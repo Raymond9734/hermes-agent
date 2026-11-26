@@ -258,7 +258,9 @@ def _apply_limits(rows: list[dict]) -> None:
         slug = str(row.get("slug") or "")
         # Window plans say their limits in plan_usage (gauges + limit line); a credential cooldown chip
         # beside them would show a second, unrelated reset time.
-        if slug not in pooled or row.get("is_user_defined") or row.get("plan_usage"):
+        # A shared grant does not use this profile's credential pool.
+        if (slug not in pooled or row.get("is_user_defined") or row.get("plan_usage")
+                or row.get("source") == "shared-root-oauth"):
             continue
         try:
             state = load_pool(slug).limit_state(row.get("models") or [])
@@ -318,7 +320,10 @@ def _apply_usage(rows: list[dict]) -> None:
     pooled_sizes = {slug: len(entries) for slug, entries in read_credential_pool().items() if entries}
     for row in rows:
         slug = str(row.get("slug") or "")
-        if not slug or row.get("is_user_defined") or row.get("authenticated") is False:
+        # Legacy account-usage probes can rotate credentials or fall back to the local pool.
+        # The picker has permission to read the exact shared grant, not to do either here.
+        if (not slug or row.get("is_user_defined") or row.get("authenticated") is False
+                or row.get("source") == "shared-root-oauth"):
             continue
         supports_usage = has_account_usage(slug)
         # A single-entry pool (or no pool) is the single-account case: the legacy gauge stays
@@ -770,10 +775,9 @@ def _filter_explicit_provider_rows(rows: list[dict], ctx: ConfigContext) -> list
 
     def _is_explicit(row: dict, slug: str) -> bool:
         # Managed local models are explicit configuration by existence (gigabytes downloaded into the
-        # machine-scoped dir); there is deliberately no config credential, so without the source clause
-        # the row would only survive on the profile where Use was last clicked.
+        # machine-scoped dir); a validated shared grant is also explicit, but has no local pool entry.
         if (row.get("is_user_defined") or (current_slug and slug == current_slug)
-                or row.get("source") == "local-runtime"):
+                or row.get("source") in {"local-runtime", "shared-root-oauth"}):
             return True
         if slug == "moa":
             # Virtual routing mode, not a configured provider: hide unless current (above) or the user

@@ -948,6 +948,30 @@ def _lap_overlay_rows(b: _PickerBuild, data: dict, user_providers: dict) -> None
         b.seen_slugs.add(pid.lower())
 
 
+def _lap_shared_codex_row(b: _PickerBuild) -> None:
+    """A reference owns the Codex slot, even when it no longer authorizes that slot."""
+    from hermes_cli.auth_codex import _codex_access_token_is_expiring, resolve_shared_codex_runtime
+    from hermes_cli.auth_shared_providers import SharedProviderAuthError, active_shared_provider_refs
+
+    slug = "openai-codex"
+    if slug in b.excluded:
+        return
+    try:
+        ref = active_shared_provider_refs().get(slug)
+        if ref is None:
+            return  # Standalone profiles keep the ordinary OAuth/pool discovery path.
+        runtime = resolve_shared_codex_runtime(ref, read_only=True)
+    except SharedProviderAuthError:
+        b.seen_slugs.add(slug)
+        return
+    b.seen_slugs.add(slug)
+    if _codex_access_token_is_expiring(runtime["api_key"], 0):
+        return  # An expired token may be recoverable at execution, but reads must not rotate it.
+    models = _live_or_curated_ids(slug, b.curated, merge_models_dev=False,
+                                 non_blocking=b.non_blocking_catalogs)
+    b.add_builtin_row(slug, get_label(slug), b.current_provider_norm == slug, models, "shared-root-oauth")
+
+
 def _lap_canonical_rows(b: _PickerBuild) -> None:
     """Section 2b: CANONICAL_PROVIDERS missed by sections 1/2."""
     from hermes_cli.auth import PROVIDER_REGISTRY
@@ -1301,6 +1325,7 @@ def list_authenticated_providers(
             pass  # best-effort; serial path still works
 
     _lap_lmstudio_row(b, user_providers if isinstance(user_providers, dict) else {})
+    _lap_shared_codex_row(b)
     _lap_builtin_rows(b, data, user_providers)
     _lap_overlay_rows(b, data, user_providers)
     _lap_canonical_rows(b)

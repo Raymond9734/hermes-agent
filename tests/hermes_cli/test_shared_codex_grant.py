@@ -80,6 +80,116 @@ def test_explicit_named_provider_uses_only_referenced_root_row(stores, monkeypat
     assert not (worker / 'auth.json').exists()
 
 
+def test_picker_lists_only_the_usable_shared_codex_grant(stores, monkeypatch):
+    from hermes_cli.inventory import build_model_options_payload, load_picker_context
+    from hermes_cli.models import _cache_entry, _credential_fingerprint, _store_cache_entry
+
+    root, worker = stores
+    model = 'gpt-6.2-sol'
+    settings = config(model={'provider': 'anthropic', 'default': 'claude-sonnet-5-5'})
+    atomic_config_replace(worker / 'config.yaml', settings)
+    monkeypatch.setenv('ANTHROPIC_API_KEY', 'fixture-anthropic-key')
+    unrelated = row('unrelated', 'other-account')
+    seed(root, unrelated, row())
+    _store_cache_entry(PROVIDER, _cache_entry(_credential_fingerprint(PROVIDER), [model]))
+
+    def forbidden_refresh(*a, **kw):
+        pytest.fail('the picker must not refresh a shared grant')
+
+    def usage_supported(slug):
+        assert slug != PROVIDER, 'shared credentials must not enter the legacy account-usage probe'
+        return False
+
+    monkeypatch.setattr(auth, 'refresh_codex_oauth_pure', forbidden_refresh)
+    monkeypatch.setattr('agent.account_usage_cache.has_account_usage', usage_supported)
+    monkeypatch.setattr('hermes_cli.inventory._prewarm_pricing_async', lambda *a, **kw: None)
+    monkeypatch.setattr('hermes_cli.models._spawn_swr_refresh', lambda *a, **kw: None)
+
+    def picker(*, explicit_only, include_unconfigured=False):
+        before = (root / 'auth.json').read_bytes()
+        local = worker / 'auth.json'
+        local_before = local.read_bytes() if local.exists() else None
+        payload = build_model_options_payload(load_picker_context(), explicit_only=explicit_only,
+                                              include_unconfigured=include_unconfigured)
+        assert payload['provider'] == 'anthropic'
+        assert payload['model'] == 'claude-sonnet-5-5'
+        assert (root / 'auth.json').read_bytes() == before
+        assert (local.read_bytes() if local.exists() else None) == local_before
+        assert 'fixture-refresh' not in json.dumps(payload)
+        return {r['slug']: r for r in payload['providers']}
+
+    for explicit_only in (True, False):
+        codex = picker(explicit_only=explicit_only).get(PROVIDER)
+        assert codex is not None, 'the exact shared grant must show up alongside the Anthropic default'
+        assert codex['authenticated'] and not codex['is_current']
+        assert codex['models'] == [model]
+
+    for selected in ([], [row(last_status='dead')], [row(access_token=token(expired=True))],
+                     [row(access_token=token(subject='other-member'))]):
+        seed(root, unrelated, *selected)
+        assert PROVIDER not in picker(explicit_only=True)
+        skeleton = picker(explicit_only=True, include_unconfigured=True)[PROVIDER]
+        assert skeleton['authenticated'] is False and not skeleton['models']
+
+    seed(root, unrelated, row())
+    settings['auth'].pop('shared_providers')
+    atomic_config_replace(worker / 'config.yaml', settings)
+    assert PROVIDER not in picker(explicit_only=True)
+
+    # A broken explicit reference must not fall through to an otherwise usable local login.
+    auth._save_auth_store({'providers': {}, 'credential_pool': {PROVIDER: [unrelated]}},
+                          target_path=worker / 'auth.json')
+    settings['auth']['shared_providers'] = {PROVIDER: {'source': 'root', 'credential_id': 'invalid / id',
+                                                     'account_id': ACCOUNT, 'subject': SUBJECT}}
+    atomic_config_replace(worker / 'config.yaml', settings)
+    assert PROVIDER not in picker(explicit_only=False)
+
+    # An ordinary standalone profile with its own login still shows the OAuth row.
+    settings['auth'].pop('shared_providers')
+    atomic_config_replace(worker / 'config.yaml', settings)
+    monkeypatch.setattr('agent.account_usage_cache.has_account_usage', lambda slug: False)
+    codex = picker(explicit_only=True)[PROVIDER]
+    assert codex['authenticated'] and codex['source'] != 'shared-root-oauth'
+
+
+@pytest.mark.parametrize('custom', [False, True])
+def test_main_model_switch_round_trips_between_anthropic_and_shared_codex(stores, monkeypatch, custom):
+    from hermes_cli.model_assignment import apply_main_model_assignment, validated_main_model_selection
+
+    root, worker = stores
+    grant = row()
+    seed(root, grant)
+    anthropic, codex = 'claude-sonnet-5-5', 'gpt-6.2-sol'
+    anth_url = 'https://anthropic-proxy.invalid' if custom else 'https://api.anthropic.com'
+    anth_provider = 'custom:anthropic' if custom else 'anthropic'
+    endpoint = {'anthropic': {'base_url': anth_url, 'api_mode': 'anthropic_messages',
+                              'api_key': 'fixture-anthropic-key'}} if custom else {}
+    if not custom:
+        monkeypatch.setenv('ANTHROPIC_API_KEY', 'fixture-anthropic-key')
+    settings = config(model={'provider': anth_provider, 'default': anthropic,
+                             'api_mode': 'anthropic_messages', 'base_url': anth_url}, providers=endpoint)
+    atomic_config_replace(worker / 'config.yaml', settings)
+
+    def validate(model, provider, *, base_url, api_mode, api_key, **kwargs):
+        if provider == PROVIDER:
+            assert (model, base_url, api_mode, api_key) == (
+                codex, DEFAULT_CODEX_BASE_URL, 'codex_responses', grant['access_token'])
+        else:
+            assert (model, base_url, api_mode, api_key) == (anthropic, anth_url, 'anthropic_messages', 'fixture-anthropic-key')
+        return {'accepted': True, 'persist': True, 'recognized': True}
+    monkeypatch.setattr('hermes_cli.models_validate.validate_requested_model', validate)
+
+    for provider, model in ((PROVIDER, codex), ('anthropic', anthropic), (PROVIDER, codex)):
+        selection = validated_main_model_selection(settings, provider, model)
+        settings['model'] = apply_main_model_assignment(settings['model'], selection)
+        atomic_config_replace(worker / 'config.yaml', settings)
+        assert settings['model']['provider'] == (PROVIDER if provider == PROVIDER else anth_provider)
+        runtime = resolve_runtime_provider(requested=settings['model']['provider'])
+        assert runtime['base_url'] == (DEFAULT_CODEX_BASE_URL if provider == PROVIDER else anth_url)
+        assert runtime['api_mode'] == ('codex_responses' if provider == PROVIDER else 'anthropic_messages')
+        assert settings['providers'] == endpoint
+
+
 @pytest.mark.parametrize('replacement', [None, row(account='different-account'), row(last_status='dead'),
                                           row(access_token=token(subject='different-member')),
                                           row(auth_type='api_key'), row(source='env:FAKE')])
